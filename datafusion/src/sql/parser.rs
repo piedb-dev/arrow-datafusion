@@ -165,6 +165,7 @@ impl<'a> DFParser<'a> {
                         // use custom parsing
                         self.parse_create()
                     }
+                    //Keyword::INSERT => Ok(self.parser.parse_insert()?),
                     _ => {
                         // use the native parser
                         Ok(Statement::Statement(Box::from(
@@ -181,7 +182,6 @@ impl<'a> DFParser<'a> {
             }
         }
     }
-
     /// Parse a SQL CREATE statement
     pub fn parse_create(&mut self) -> Result<Statement, ParserError> {
         if self.parser.parse_keyword(Keyword::EXTERNAL) {

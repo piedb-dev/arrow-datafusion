@@ -27,7 +27,7 @@ use crate::logical_plan::{combine_filters, Expr};
 use crate::physical_plan::file_format::{
     FileScanConfig, DEFAULT_PARTITION_COLUMN_DATATYPE,
 };
-use crate::physical_plan::hybrid::HybridExec;
+use crate::physical_plan::hybrid::{HybridExec, MemoryPartitions};
 use crate::physical_plan::{ExecutionPlan, Statistics};
 use arrow::array::TimestampSecondArray;
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -38,13 +38,15 @@ use futures::{
     stream::{self},
     StreamExt, TryStreamExt,
 };
+use parquet::record::Row;
+use std::boxed::Box;
+use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::{any::Any, convert::TryInto};
 
 pub struct HybridTable {
     schema: SchemaRef,
-    // in-memory table data
-    batches: Vec<Vec<RecordBatch>>,
     // on-disk table data  with parquet format
     object_store: Arc<dyn ObjectStore>,
     // table path
@@ -54,13 +56,14 @@ pub struct HybridTable {
     // File fields + partition columns
     table_schema: SchemaRef,
     options: ListingOptions,
+    memory_table: Arc<Mutex<MemoryPartitions>>,
 }
 
 impl HybridTable {
     pub fn try_new(
         config: ListingTableConfig,
         schema: SchemaRef,
-        batches: &[Vec<RecordBatch>],
+        memory_table: Arc<Mutex<MemoryPartitions>>,
     ) -> Result<Self> {
         let file_schema = config
             .file_schema
@@ -79,15 +82,14 @@ impl HybridTable {
         }
         Ok(Self {
             schema,
-            batches: batches.to_vec(),
             object_store: config.object_store.clone(),
             table_path: config.table_path.clone(),
             file_schema,
             table_schema: Arc::new(Schema::new(table_fields)),
             options,
+            memory_table,
         })
     }
-
     async fn list_files_for_scan<'a>(
         &'a self,
         filters: &'a [Expr],
@@ -158,7 +160,7 @@ impl TableProvider for HybridTable {
             limit,
             table_partition_cols: self.options.table_partition_cols.clone(),
         };
-        let he = HybridExec::try_new(&self.batches.clone(), fconfig, predicate)?;
+        let he = HybridExec::try_new(self.memory_table.clone(), fconfig, predicate)?;
         Ok(Arc::new(he))
     }
 }
@@ -194,14 +196,31 @@ mod tests {
         let record_batch_reader = arrow_reader
             .get_record_reader(60)
             .expect("Failed to read into array!");
-        let batches = vec![record_batch_reader
+        let record_batches = record_batch_reader
             .collect::<ArrowResult<Vec<RecordBatch>>>()
-            .unwrap()];
-        assert_eq!(batches.len(), 1);
+            .unwrap();
+        let mut memory_table = Arc::new(Mutex::new(MemoryPartitions::new()));
+        {
+            let mut guard = memory_table.lock().unwrap();
+            guard.add_record_batch(record_batches[0].clone());
+        }
         let opt = ListingOptions::new(Arc::new(ParquetFormat::default()));
         let mut ctx = ExecutionContext::new();
-        ctx.register_hybrid_table("cpu_usage", &path, opt, &batches, Some(schema.clone())).await?;
-        let df = ctx.sql("SELECT * FROM cpu_usage limit 1;").await?;
+        ctx.register_hybrid_table(
+            "cpu_usage",
+            &path,
+            opt,
+            memory_table.clone(),
+            Some(schema.clone()),
+        )
+        .await?;
+        let df = ctx.sql("SELECT count(*) FROM cpu_usage;").await?;
+        df.show().await?;
+        {
+            let mut guard = memory_table.lock().unwrap();
+            guard.add_record_batch(record_batches[1].clone());
+        }
+        let df = ctx.sql("SELECT count(*) FROM cpu_usage;").await?;
         df.show().await?;
         Ok(())
     }

@@ -43,10 +43,11 @@ use crate::{
 use arrow::record_batch::RecordBatch;
 use log::{debug, trace};
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as RMutex};
 use std::{fs, path::PathBuf};
 
 use futures::{StreamExt, TryStreamExt};
@@ -83,6 +84,7 @@ use crate::physical_optimizer::repartition::Repartition;
 
 use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use crate::logical_plan::plan::Explain;
+use crate::physical_plan::hybrid::MemoryPartitions;
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udf::ScalarUDF;
 use crate::physical_plan::ExecutionPlan;
@@ -445,7 +447,7 @@ impl ExecutionContext {
         name: &'a str,
         uri: &'a str,
         options: ListingOptions,
-        memory_partitions: &[Vec<RecordBatch>],
+        memory_table: Arc<RMutex<MemoryPartitions>>,
         provided_schema: Option<SchemaRef>,
     ) -> Result<()> {
         let (object_store, path) = self.object_store(uri)?;
@@ -460,8 +462,7 @@ impl ExecutionContext {
         let config = ListingTableConfig::new(object_store, path)
             .with_listing_options(options)
             .with_schema(resolved_schema.clone());
-        let table =
-            HybridTable::try_new(config, resolved_schema.clone(), memory_partitions)?;
+        let table = HybridTable::try_new(config, resolved_schema.clone(), memory_table)?;
         self.register_table(name, Arc::new(table))?;
         Ok(())
     }
