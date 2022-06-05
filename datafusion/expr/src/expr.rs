@@ -20,6 +20,7 @@
 use crate::aggregate_function;
 use crate::built_in_function;
 use crate::expr_fn::binary_expr;
+use crate::logical_plan::Subquery;
 use crate::window_frame;
 use crate::window_function;
 use crate::AggregateUDF;
@@ -226,10 +227,46 @@ pub enum Expr {
         /// Whether the expression is negated
         negated: bool,
     },
+    /// EXISTS subquery
+    Exists {
+        /// subquery that will produce a single column of data
+        subquery: Subquery,
+        /// Whether the expression is negated
+        negated: bool,
+    },
+    /// IN subquery
+    InSubquery {
+        /// The expression to compare
+        expr: Box<Expr>,
+        /// subquery that will produce a single column of data to compare against
+        subquery: Subquery,
+        /// Whether the expression is negated
+        negated: bool,
+    },
+    /// Scalar subquery
+    ScalarSubquery(Subquery),
     /// Represents a reference to all fields in a schema.
     Wildcard,
     /// Represents a reference to all fields in a specific schema.
     QualifiedWildcard { qualifier: String },
+    /// List of grouping set expressions. Only valid in the context of an aggregate
+    /// GROUP BY expression list
+    GroupingSet(GroupingSet),
+}
+
+/// Grouping sets
+/// See https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS
+/// for Postgres definition.
+/// See https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-groupby.html
+/// for Apache Spark definition.
+#[derive(Clone, PartialEq, Hash)]
+pub enum GroupingSet {
+    /// Rollup grouping sets
+    Rollup(Vec<Expr>),
+    /// Cube grouping sets
+    Cube(Vec<Expr>),
+    /// User-defined grouping sets
+    GroupingSets(Vec<Vec<Expr>>),
 }
 
 /// Fixed seed for the hashing so that Ords are consistent across runs
@@ -255,6 +292,40 @@ impl Expr {
     /// This represents how a column with this expression is named when no alias is chosen
     pub fn name(&self, input_schema: &DFSchema) -> Result<String> {
         create_name(self, input_schema)
+    }
+
+    /// Return String representation of the variant represented by `self`
+    /// Useful for non-rust based bindings
+    pub fn variant_name(&self) -> &str {
+        match self {
+            Expr::AggregateFunction { .. } => "AggregateFunction",
+            Expr::AggregateUDF { .. } => "AggregateUDF",
+            Expr::Alias(..) => "Alias",
+            Expr::Between { .. } => "Between",
+            Expr::BinaryExpr { .. } => "BinaryExpr",
+            Expr::Case { .. } => "Case",
+            Expr::Cast { .. } => "Cast",
+            Expr::Column(..) => "Column",
+            Expr::Exists { .. } => "Exists",
+            Expr::GetIndexedField { .. } => "GetIndexedField",
+            Expr::GroupingSet(..) => "GroupingSet",
+            Expr::InList { .. } => "InList",
+            Expr::InSubquery { .. } => "InSubquery",
+            Expr::IsNotNull(..) => "IsNotNull",
+            Expr::IsNull(..) => "IsNull",
+            Expr::Literal(..) => "Literal",
+            Expr::Negative(..) => "Negative",
+            Expr::Not(..) => "Not",
+            Expr::QualifiedWildcard { .. } => "QualifiedWildcard",
+            Expr::ScalarFunction { .. } => "ScalarFunction",
+            Expr::ScalarSubquery { .. } => "ScalarSubquery",
+            Expr::ScalarUDF { .. } => "ScalarUDF",
+            Expr::ScalarVariable(..) => "ScalarVariable",
+            Expr::Sort { .. } => "Sort",
+            Expr::TryCast { .. } => "TryCast",
+            Expr::WindowFunction { .. } => "WindowFunction",
+            Expr::Wildcard => "Wildcard",
+        }
     }
 
     /// Return `self == other`
@@ -431,6 +502,25 @@ impl fmt::Debug for Expr {
             Expr::Negative(expr) => write!(f, "(- {:?})", expr),
             Expr::IsNull(expr) => write!(f, "{:?} IS NULL", expr),
             Expr::IsNotNull(expr) => write!(f, "{:?} IS NOT NULL", expr),
+            Expr::Exists {
+                subquery,
+                negated: true,
+            } => write!(f, "NOT EXISTS ({:?})", subquery),
+            Expr::Exists {
+                subquery,
+                negated: false,
+            } => write!(f, "EXISTS ({:?})", subquery),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated: true,
+            } => write!(f, "{:?} NOT IN ({:?})", expr, subquery),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated: false,
+            } => write!(f, "{:?} IN ({:?})", expr, subquery),
+            Expr::ScalarSubquery(subquery) => write!(f, "({:?})", subquery),
             Expr::BinaryExpr { left, op, right } => {
                 write!(f, "{:?} {} {:?}", left, op, right)
             }
@@ -518,6 +608,51 @@ impl fmt::Debug for Expr {
             Expr::GetIndexedField { ref expr, key } => {
                 write!(f, "({:?})[{}]", expr, key)
             }
+            Expr::GroupingSet(grouping_sets) => match grouping_sets {
+                GroupingSet::Rollup(exprs) => {
+                    // ROLLUP (c0, c1, c2)
+                    write!(
+                        f,
+                        "ROLLUP ({})",
+                        exprs
+                            .iter()
+                            .map(|e| format!("{}", e))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                }
+                GroupingSet::Cube(exprs) => {
+                    // CUBE (c0, c1, c2)
+                    write!(
+                        f,
+                        "CUBE ({})",
+                        exprs
+                            .iter()
+                            .map(|e| format!("{}", e))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                }
+                GroupingSet::GroupingSets(lists_of_exprs) => {
+                    // GROUPING SETS ((c0), (c1, c2), (c3, c4))
+                    write!(
+                        f,
+                        "GROUPING SETS ({})",
+                        lists_of_exprs
+                            .iter()
+                            .map(|exprs| format!(
+                                "({})",
+                                exprs
+                                    .iter()
+                                    .map(|e| format!("{}", e))
+                                    .collect::<Vec<String>>()
+                                    .join(", ")
+                            ))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                }
+            },
         }
     }
 }
@@ -618,6 +753,13 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
             let expr = create_name(expr, input_schema)?;
             Ok(format!("{} IS NOT NULL", expr))
         }
+        Expr::Exists { negated: true, .. } => Ok("NOT EXISTS".to_string()),
+        Expr::Exists { negated: false, .. } => Ok("EXISTS".to_string()),
+        Expr::InSubquery { negated: true, .. } => Ok("NOT IN".to_string()),
+        Expr::InSubquery { negated: false, .. } => Ok("IN".to_string()),
+        Expr::ScalarSubquery(subquery) => {
+            Ok(subquery.subquery.schema().field(0).name().clone())
+        }
         Expr::GetIndexedField { expr, key } => {
             let expr = create_name(expr, input_schema)?;
             Ok(format!("{}[{}]", expr, key))
@@ -665,6 +807,26 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
             }
             Ok(format!("{}({})", fun.name, names.join(",")))
         }
+        Expr::GroupingSet(grouping_set) => match grouping_set {
+            GroupingSet::Rollup(exprs) => Ok(format!(
+                "ROLLUP ({})",
+                create_names(exprs.as_slice(), input_schema)?
+            )),
+            GroupingSet::Cube(exprs) => Ok(format!(
+                "CUBE ({})",
+                create_names(exprs.as_slice(), input_schema)?
+            )),
+            GroupingSet::GroupingSets(lists_of_exprs) => {
+                let mut list_of_names = vec![];
+                for exprs in lists_of_exprs {
+                    list_of_names.push(format!(
+                        "({})",
+                        create_names(exprs.as_slice(), input_schema)?
+                    ));
+                }
+                Ok(format!("GROUPING SETS ({})", list_of_names.join(", ")))
+            }
+        },
         Expr::InList {
             expr,
             list,
@@ -703,6 +865,15 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
             "Create name does not support qualified wildcard".to_string(),
         )),
     }
+}
+
+/// Create a comma separated list of names from a list of expressions
+fn create_names(exprs: &[Expr], input_schema: &DFSchema) -> Result<String> {
+    Ok(exprs
+        .iter()
+        .map(|e| create_name(e, input_schema))
+        .collect::<Result<Vec<String>>>()?
+        .join(", "))
 }
 
 #[cfg(test)]

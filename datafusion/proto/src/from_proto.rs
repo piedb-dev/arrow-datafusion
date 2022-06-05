@@ -21,29 +21,22 @@ use crate::protobuf::plan_type::PlanTypeEnum::{
     OptimizedLogicalPlan, OptimizedPhysicalPlan,
 };
 use crate::protobuf::{OptimizedLogicalPlanType, OptimizedPhysicalPlanType};
-use datafusion::logical_plan::plan::StringifiedPlan;
-use datafusion::logical_plan::{FunctionRegistry, PlanType};
-use datafusion::prelude::bit_length;
-use datafusion::{
-    arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionMode},
-    error::DataFusionError,
-    logical_expr::{BuiltInWindowFunction, BuiltinScalarFunction},
-    logical_plan::{
-        abs, acos, ascii, asin, atan, ceil, character_length, chr, concat_expr,
-        concat_ws_expr, cos, digest, exp, floor, left, ln, log10, log2, now_expr, nullif,
-        random, regexp_replace, repeat, replace, reverse, right, round, signum, sin,
-        split_part, sqrt, starts_with, strpos, substr, tan, to_hex, to_timestamp_micros,
-        to_timestamp_millis, to_timestamp_seconds, translate, trunc,
-        window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
-        Column, DFField, DFSchema, DFSchemaRef, Expr, Operator,
-    },
-    physical_plan::aggregates::AggregateFunction,
-    prelude::{
-        array, btrim, coalesce, date_part, date_trunc, lower, lpad, ltrim, md5,
-        octet_length, regexp_match, rpad, rtrim, sha224, sha256, sha384, sha512, trim,
-        upper,
-    },
-    scalar::ScalarValue,
+use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionMode};
+use datafusion::logical_plan::FunctionRegistry;
+use datafusion_common::{
+    Column, DFField, DFSchema, DFSchemaRef, DataFusionError, ScalarValue,
+};
+use datafusion_expr::{
+    abs, acos, array, ascii, asin, atan, bit_length, btrim, ceil, character_length, chr,
+    coalesce, concat_expr, concat_ws_expr, cos, date_part, date_trunc, digest, exp,
+    floor, left, ln, log10, log2,
+    logical_plan::{PlanType, StringifiedPlan},
+    lower, lpad, ltrim, md5, now_expr, nullif, octet_length, power, random, regexp_match,
+    regexp_replace, repeat, replace, reverse, right, round, rpad, rtrim, sha224, sha256,
+    sha384, sha512, signum, sin, split_part, sqrt, starts_with, strpos, substr, tan,
+    to_hex, to_timestamp_micros, to_timestamp_millis, to_timestamp_seconds, translate,
+    trim, trunc, upper, AggregateFunction, BuiltInWindowFunction, BuiltinScalarFunction,
+    Expr, Operator, WindowFrame, WindowFrameBound, WindowFrameUnits,
 };
 use std::sync::Arc;
 
@@ -345,9 +338,16 @@ impl TryFrom<&protobuf::arrow_type::ArrowTypeEnum> for DataType {
                 let union_types = union
                     .union_types
                     .iter()
-                    .map(|field| field.try_into())
+                    .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?;
-                DataType::Union(union_types, union_mode)
+
+                // Default to index based type ids if not provided
+                let type_ids = match union.type_ids.is_empty() {
+                    true => (0..union_types.len() as i8).collect(),
+                    false => union.type_ids.iter().map(|i| *i as i8).collect(),
+                };
+
+                DataType::Union(union_types, type_ids, union_mode)
             }
             arrow_type::ArrowTypeEnum::Dictionary(dict) => {
                 let key_datatype = dict.as_ref().key.as_deref().required("key")?;
@@ -466,6 +466,8 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::Translate => Self::Translate,
             ScalarFunction::RegexpMatch => Self::RegexpMatch,
             ScalarFunction::Coalesce => Self::Coalesce,
+            ScalarFunction::Power => Self::Power,
+            ScalarFunction::StructFun => Self::Struct,
         }
     }
 }
@@ -494,6 +496,7 @@ impl From<protobuf::AggregateFunction> for AggregateFunction {
                 Self::ApproxPercentileContWithWeight
             }
             protobuf::AggregateFunction::ApproxMedian => Self::ApproxMedian,
+            protobuf::AggregateFunction::Grouping => Self::Grouping,
         }
     }
 }
@@ -672,7 +675,7 @@ impl TryFrom<&protobuf::ScalarListValue> for ScalarValue {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 ScalarValue::List(
-                    Some(Box::new(typechecked_values)),
+                    Some(typechecked_values),
                     Box::new(leaf_scalar_type.into()),
                 )
             }
@@ -707,7 +710,7 @@ impl TryFrom<&protobuf::ScalarListValue> for ScalarValue {
                 ScalarValue::List(
                     match typechecked_values.len() {
                         0 => None,
-                        _ => Some(Box::new(typechecked_values)),
+                        _ => Some(typechecked_values),
                     },
                     Box::new((list_type).try_into()?),
                 )
@@ -858,7 +861,7 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
                     .map(|val| val.try_into())
                     .collect::<Result<Vec<_>, _>>()?;
 
-                Self::List(Some(Box::new(typechecked_values)), scalar_type)
+                Self::List(Some(typechecked_values), scalar_type)
             }
             Value::NullListValue(v) => {
                 let datatype = v.datatype.as_ref().required("datatype")?;
@@ -912,7 +915,6 @@ pub fn parse_expr(
     proto: &protobuf::LogicalExprNode,
     registry: &dyn FunctionRegistry,
 ) -> Result<Expr, Error> {
-    use datafusion::logical_expr::window_function;
     use protobuf::{logical_expr_node::ExprType, window_expr_node, ScalarFunction};
 
     let expr_type = proto
@@ -968,7 +970,7 @@ pub fn parse_expr(
                     let aggr_function = protobuf::AggregateFunction::try_from(i)?.into();
 
                     Ok(Expr::WindowFunction {
-                        fun: window_function::WindowFunction::AggregateFunction(
+                        fun: datafusion_expr::window_function::WindowFunction::AggregateFunction(
                             aggr_function,
                         ),
                         args: vec![parse_required_expr(&expr.expr, registry, "expr")?],
@@ -983,7 +985,7 @@ pub fn parse_expr(
                         .into();
 
                     Ok(Expr::WindowFunction {
-                        fun: window_function::WindowFunction::BuiltInWindowFunction(
+                        fun: datafusion_expr::window_function::WindowFunction::BuiltInWindowFunction(
                             built_in_function,
                         ),
                         args: vec![parse_required_expr(&expr.expr, registry, "expr")?],
@@ -1242,6 +1244,10 @@ pub fn parse_expr(
                         .iter()
                         .map(|expr| parse_expr(expr, registry))
                         .collect::<Result<Vec<_>, _>>()?,
+                )),
+                ScalarFunction::Power => Ok(power(
+                    parse_expr(&args[0], registry)?,
+                    parse_expr(&args[1], registry)?,
                 )),
                 _ => Err(proto_error(
                     "Protobuf deserialization error: Unsupported scalar function",

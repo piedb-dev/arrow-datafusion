@@ -35,7 +35,6 @@ use arrow::{
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
 use futures::stream::{Fuse, FusedStream};
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -108,7 +107,6 @@ impl SortPreservingMergeExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for SortPreservingMergeExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -150,7 +148,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
         )))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -182,7 +180,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
             )),
             1 => {
                 // bypass if there is only one partition to merge (no metrics in this case either)
-                let result = self.input.execute(0, context).await;
+                let result = self.input.execute(0, context);
                 debug!("Done getting stream for SortPreservingMergeExec::execute with 1 input");
                 result
             }
@@ -210,20 +208,13 @@ impl ExecutionPlan for SortPreservingMergeExec {
                             )
                         })
                         .collect(),
-                    Err(_) => {
-                        futures::future::try_join_all((0..input_partitions).map(
-                            |partition| {
-                                let context = context.clone();
-                                async move {
-                                    self.input
-                                        .execute(partition, context)
-                                        .await
-                                        .map(|stream| SortedStream::new(stream, 0))
-                                }
-                            },
-                        ))
-                        .await?
-                    }
+                    Err(_) => (0..input_partitions)
+                        .map(|partition| {
+                            let stream =
+                                self.input.execute(partition, context.clone())?;
+                            Ok(SortedStream::new(stream, 0))
+                        })
+                        .collect::<Result<_>>()?,
                 };
 
                 debug!("Done setting up sender-receiver for SortPreservingMergeExec::execute");
@@ -560,7 +551,7 @@ impl SortPreservingMergeStream {
 
             match self.min_heap.pop() {
                 Some(mut cursor) => {
-                    let stream_idx = cursor.stream_idx;
+                    let stream_idx = cursor.stream_idx();
                     let batch_idx = self.batches[stream_idx].len() - 1;
                     let row_idx = cursor.advance();
 
@@ -610,7 +601,6 @@ impl RecordBatchStream for SortPreservingMergeStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::from_slice::FromSlice;
     use crate::physical_plan::metrics::MetricValue;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
@@ -620,7 +610,6 @@ mod tests {
     use crate::arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::expressions::col;
-    use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::sorts::sort::SortExec;
     use crate::physical_plan::{collect, common};
@@ -906,24 +895,9 @@ mod tests {
     async fn test_partition_sort() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions).unwrap();
-
-        let csv = Arc::new(CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: Arc::clone(&schema),
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        ));
+        let csv = test::scan_partitioned_csv(partitions).unwrap();
+        let schema = csv.schema();
 
         let sort = vec![
             PhysicalSortExpr {
@@ -993,24 +967,8 @@ mod tests {
         sizes: &[usize],
         context: Arc<TaskContext>,
     ) -> Arc<dyn ExecutionPlan> {
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions).unwrap();
-
-        let csv = Arc::new(CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: schema,
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        ));
+        let csv = test::scan_partitioned_csv(partitions).unwrap();
 
         let sorted = basic_sort(csv, sort, context).await;
         let split: Vec<_> = sizes.iter().map(|x| split_batch(&sorted, *x)).collect();
@@ -1209,7 +1167,7 @@ mod tests {
 
         for partition in 0..partition_count {
             let (sender, receiver) = mpsc::channel(1);
-            let mut stream = batches.execute(partition, task_ctx.clone()).await.unwrap();
+            let mut stream = batches.execute(partition, task_ctx.clone()).unwrap();
             let join_handle = tokio::spawn(async move {
                 while let Some(batch) = stream.next().await {
                     sender.send(batch).await.unwrap();

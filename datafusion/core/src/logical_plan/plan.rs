@@ -25,10 +25,10 @@ pub use crate::logical_expr::{
     logical_plan::{
         display::{GraphvizVisitor, IndentVisitor},
         Aggregate, Analyze, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
-        CreateMemoryTable, CrossJoin, DropTable, EmptyRelation, Explain, Extension,
-        FileType, Filter, Join, JoinConstraint, JoinType, Limit, LogicalPlan,
-        Partitioning, PlanType, PlanVisitor, Projection, Repartition, Sort,
-        StringifiedPlan, SubqueryAlias, TableScan, ToStringifiedPlan, Union,
+        CreateMemoryTable, CreateView, CrossJoin, DropTable, EmptyRelation, Explain,
+        Extension, FileType, Filter, Join, JoinConstraint, JoinType, Limit, LogicalPlan,
+        Offset, Partitioning, PlanType, PlanVisitor, Projection, Repartition, Sort,
+        StringifiedPlan, Subquery, SubqueryAlias, TableScan, ToStringifiedPlan, Union,
         UserDefinedLogicalNode, Values, Window,
     },
     TableProviderFilterPushDown, TableSource,
@@ -100,8 +100,9 @@ pub fn source_as_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{col, lit, LogicalPlanBuilder};
+    use super::super::{col, lit};
     use super::*;
+    use crate::test_util::scan_empty;
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn employee_schema() -> Schema {
@@ -115,18 +116,14 @@ mod tests {
     }
 
     fn display_plan() -> LogicalPlan {
-        LogicalPlanBuilder::scan_empty(
-            Some("employee_csv"),
-            &employee_schema(),
-            Some(vec![0, 3]),
-        )
-        .unwrap()
-        .filter(col("state").eq(lit("CO")))
-        .unwrap()
-        .project(vec![col("id")])
-        .unwrap()
-        .build()
-        .unwrap()
+        scan_empty(Some("employee_csv"), &employee_schema(), Some(vec![0, 3]))
+            .unwrap()
+            .filter(col("state").eq(lit("CO")))
+            .unwrap()
+            .project(vec![col("id")])
+            .unwrap()
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -135,7 +132,7 @@ mod tests {
 
         let expected = "Projection: #employee_csv.id\
         \n  Filter: #employee_csv.state = Utf8(\"CO\")\
-        \n    TableScan: employee_csv projection=Some([0, 3])";
+        \n    TableScan: employee_csv projection=Some([id, state])";
 
         assert_eq!(expected, format!("{}", plan.display_indent()));
     }
@@ -146,7 +143,7 @@ mod tests {
 
         let expected = "Projection: #employee_csv.id [id:Int32]\
                         \n  Filter: #employee_csv.state = Utf8(\"CO\") [id:Int32, state:Utf8]\
-                        \n    TableScan: employee_csv projection=Some([0, 3]) [id:Int32, state:Utf8]";
+                        \n    TableScan: employee_csv projection=Some([id, state]) [id:Int32, state:Utf8]";
 
         assert_eq!(expected, format!("{}", plan.display_indent_schema()));
     }
@@ -168,12 +165,12 @@ mod tests {
         );
         assert!(
             graphviz.contains(
-                r#"[shape=box label="TableScan: employee_csv projection=Some([0, 3])"]"#
+                r#"[shape=box label="TableScan: employee_csv projection=Some([id, state])"]"#
             ),
             "\n{}",
             plan.display_graphviz()
         );
-        assert!(graphviz.contains(r#"[shape=box label="TableScan: employee_csv projection=Some([0, 3])\nSchema: [id:Int32, state:Utf8]"]"#),
+        assert!(graphviz.contains(r#"[shape=box label="TableScan: employee_csv projection=Some([id, state])\nSchema: [id:Int32, state:Utf8]"]"#),
                 "\n{}", plan.display_graphviz());
         assert!(
             graphviz.contains(r#"// End DataFusion GraphViz Plan"#),
@@ -424,7 +421,7 @@ mod tests {
             Field::new("state", DataType::Utf8, false),
         ]);
 
-        LogicalPlanBuilder::scan_empty(None, &schema, Some(vec![0, 1]))
+        scan_empty(None, &schema, Some(vec![0, 1]))
             .unwrap()
             .filter(col("state").eq(lit("CO")))
             .unwrap()

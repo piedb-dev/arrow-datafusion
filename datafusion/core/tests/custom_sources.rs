@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Int32Array, PrimitiveArray, UInt64Array};
+use arrow::array::{Int32Array, Int64Array, PrimitiveArray};
 use arrow::compute::kernels::aggregate;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
@@ -24,10 +24,13 @@ use datafusion::from_slice::FromSlice;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::scalar::ScalarValue;
-use datafusion::{datasource::TableProvider, physical_plan::collect};
+use datafusion::{
+    datasource::{TableProvider, TableType},
+    physical_plan::collect,
+};
 use datafusion::{error::Result, physical_plan::DisplayFormatType};
 
-use datafusion::execution::context::{SessionContext, TaskContext};
+use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::logical_plan::{
     col, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, UNNAMED_TABLE,
 };
@@ -98,31 +101,36 @@ impl Stream for TestCustomRecordBatchStream {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for CustomExecutionPlan {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
     fn schema(&self) -> SchemaRef {
         let schema = TEST_CUSTOM_SCHEMA_REF!();
         project_schema(&schema, self.projection.as_ref()).expect("projected schema")
     }
+
     fn output_partitioning(&self) -> Partitioning {
         Partitioning::UnknownPartitioning(1)
     }
+
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
         None
     }
+
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![]
     }
+
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
-    async fn execute(
+
+    fn execute(
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
@@ -187,8 +195,13 @@ impl TableProvider for CustomTableProvider {
         TEST_CUSTOM_SCHEMA_REF!()
     }
 
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
     async fn scan(
         &self,
+        _state: &SessionState,
         projection: &Option<Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -204,7 +217,7 @@ async fn custom_source_dataframe() -> Result<()> {
     let ctx = SessionContext::new();
 
     let table = ctx.read_table(Arc::new(CustomTableProvider))?;
-    let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan())
+    let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan()?)
         .project(vec![col("c2")])?
         .build()?;
 
@@ -226,7 +239,7 @@ async fn custom_source_dataframe() -> Result<()> {
 
     let expected = format!(
         "Projection: #{}.c2\
-        \n  TableScan: {} projection=Some([1])",
+        \n  TableScan: {} projection=Some([c2])",
         UNNAMED_TABLE, UNNAMED_TABLE
     );
     assert_eq!(format!("{:?}", optimized_plan), expected);
@@ -258,7 +271,7 @@ async fn optimizers_catch_all_statistics() {
         .unwrap();
 
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan().unwrap())
         .await
         .unwrap();
 
@@ -271,12 +284,12 @@ async fn optimizers_catch_all_statistics() {
 
     let expected = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("COUNT(UInt8(1))", DataType::UInt64, false),
+            Field::new("COUNT(UInt8(1))", DataType::Int64, false),
             Field::new("MIN(test.c1)", DataType::Int32, false),
             Field::new("MAX(test.c1)", DataType::Int32, false),
         ])),
         vec![
-            Arc::new(UInt64Array::from_slice(&[4])),
+            Arc::new(Int64Array::from_slice(&[4])),
             Arc::new(Int32Array::from_slice(&[1])),
             Arc::new(Int32Array::from_slice(&[100])),
         ],

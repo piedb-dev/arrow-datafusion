@@ -71,7 +71,7 @@ async fn join() -> Result<()> {
 
     let df2 = ctx.table("aaa")?;
 
-    let a = df1.join(df2, JoinType::Inner, &["a"], &["a"])?;
+    let a = df1.join(df2, JoinType::Inner, &["a"], &["a"], None)?;
 
     let batches = a.collect().await?;
 
@@ -113,8 +113,15 @@ async fn sort_on_unprojected_columns() -> Result<()> {
         .unwrap();
     let results = df.collect().await.unwrap();
 
+    #[rustfmt::skip]
     let expected = vec![
-        "+-----+", "| a   |", "+-----+", "| 100 |", "| 10  |", "| 10  |", "| 1   |",
+        "+-----+",
+        "| a   |",
+        "+-----+",
+        "| 100 |",
+        "| 10  |",
+        "| 10  |",
+        "| 1   |",
         "+-----+",
     ];
     assert_batches_eq!(expected, &results);
@@ -145,8 +152,56 @@ async fn filter_with_alias_overwrite() -> Result<()> {
         .unwrap();
     let results = df.collect().await.unwrap();
 
+    #[rustfmt::skip]
     let expected = vec![
-        "+------+", "| a    |", "+------+", "| true |", "| true |", "+------+",
+        "+------+",
+        "| a    |",
+        "+------+",
+        "| true |",
+        "| true |",
+        "+------+",
+    ];
+    assert_batches_eq!(expected, &results);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_with_alias_overwrite() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from_slice(&[1, 10, 10, 100]))],
+    )
+    .unwrap();
+
+    let ctx = SessionContext::new();
+    let provider = MemTable::try_new(Arc::new(schema), vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let df = ctx
+        .table("t")
+        .unwrap()
+        .select(vec![col("a").alias("a")])
+        .unwrap()
+        .select(vec![(col("a").eq(lit(10))).alias("a")])
+        .unwrap()
+        .select(vec![col("a")])
+        .unwrap();
+
+    let results = df.collect().await.unwrap();
+
+    #[rustfmt::skip]
+        let expected = vec![
+        "+-------+",
+        "| a     |",
+        "+-------+",
+        "| false |",
+        "| true  |",
+        "| true  |",
+        "| false |",
+        "+-------+",
     ];
     assert_batches_eq!(expected, &results);
 

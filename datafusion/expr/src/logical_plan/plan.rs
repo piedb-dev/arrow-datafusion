@@ -22,7 +22,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{Column, DFSchemaRef, DataFusionError};
 use std::collections::HashSet;
 ///! Logical plan types
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// A LogicalPlan represents the different types of relational
@@ -66,14 +67,20 @@ pub enum LogicalPlan {
     TableScan(TableScan),
     /// Produces no rows: An empty relation with an empty schema
     EmptyRelation(EmptyRelation),
+    /// Subquery
+    Subquery(Subquery),
     /// Aliased relation provides, or changes, the name of a relation.
     SubqueryAlias(SubqueryAlias),
     /// Produces the first `n` tuples from its input and discards the rest.
     Limit(Limit),
+    /// Adjusts the starting point at which the rest of the expressions begin to effect
+    Offset(Offset),
     /// Creates an external table.
     CreateExternalTable(CreateExternalTable),
     /// Creates an in memory table.
     CreateMemoryTable(CreateMemoryTable),
+    /// Creates a new view.
+    CreateView(CreateView),
     /// Creates a new catalog schema.
     CreateCatalogSchema(CreateCatalogSchema),
     /// Creates a new catalog (aka "Database").
@@ -112,6 +119,8 @@ impl LogicalPlan {
             LogicalPlan::CrossJoin(CrossJoin { schema, .. }) => schema,
             LogicalPlan::Repartition(Repartition { input, .. }) => input.schema(),
             LogicalPlan::Limit(Limit { input, .. }) => input.schema(),
+            LogicalPlan::Offset(Offset { input, .. }) => input.schema(),
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => subquery.schema(),
             LogicalPlan::SubqueryAlias(SubqueryAlias { schema, .. }) => schema,
             LogicalPlan::CreateExternalTable(CreateExternalTable { schema, .. }) => {
                 schema
@@ -120,9 +129,8 @@ impl LogicalPlan {
             LogicalPlan::Analyze(analyze) => &analyze.schema,
             LogicalPlan::Extension(extension) => extension.node.schema(),
             LogicalPlan::Union(Union { schema, .. }) => schema,
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
-                input.schema()
-            }
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => input.schema(),
             LogicalPlan::CreateCatalogSchema(CreateCatalogSchema { schema, .. }) => {
                 schema
             }
@@ -161,6 +169,7 @@ impl LogicalPlan {
                 schemas.insert(0, schema);
                 schemas
             }
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => subquery.all_schemas(),
             LogicalPlan::SubqueryAlias(SubqueryAlias { schema, .. }) => {
                 vec![schema]
             }
@@ -180,6 +189,8 @@ impl LogicalPlan {
             | LogicalPlan::Repartition(Repartition { input, .. })
             | LogicalPlan::Sort(Sort { input, .. })
             | LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. })
+            | LogicalPlan::Offset(Offset { input, .. })
             | LogicalPlan::Filter(Filter { input, .. }) => input.all_schemas(),
             LogicalPlan::DropTable(_) => vec![],
         }
@@ -216,19 +227,28 @@ impl LogicalPlan {
                 aggr_expr,
                 ..
             }) => group_expr.iter().chain(aggr_expr.iter()).cloned().collect(),
-            LogicalPlan::Join(Join { on, .. }) => on
+            LogicalPlan::Join(Join { on, filter, .. }) => on
                 .iter()
                 .flat_map(|(l, r)| vec![Expr::Column(l.clone()), Expr::Column(r.clone())])
+                .chain(
+                    filter
+                        .as_ref()
+                        .map(|expr| vec![expr.clone()])
+                        .unwrap_or_default(),
+                )
                 .collect(),
             LogicalPlan::Sort(Sort { expr, .. }) => expr.clone(),
             LogicalPlan::Extension(extension) => extension.node.expressions(),
             // plans without expressions
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Subquery(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Limit(_)
+            | LogicalPlan::Offset(_)
             | LogicalPlan::CreateExternalTable(_)
             | LogicalPlan::CreateMemoryTable(_)
+            | LogicalPlan::CreateView(_)
             | LogicalPlan::CreateCatalogSchema(_)
             | LogicalPlan::CreateCatalog(_)
             | LogicalPlan::DropTable(_)
@@ -254,12 +274,15 @@ impl LogicalPlan {
             LogicalPlan::Join(Join { left, right, .. }) => vec![left, right],
             LogicalPlan::CrossJoin(CrossJoin { left, right, .. }) => vec![left, right],
             LogicalPlan::Limit(Limit { input, .. }) => vec![input],
+            LogicalPlan::Offset(Offset { input, .. }) => vec![input],
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => vec![subquery],
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => vec![input],
             LogicalPlan::Extension(extension) => extension.node.inputs(),
             LogicalPlan::Union(Union { inputs, .. }) => inputs.iter().collect(),
             LogicalPlan::Explain(explain) => vec![&explain.plan],
             LogicalPlan::Analyze(analyze) => vec![&analyze.input],
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => {
                 vec![input]
             }
             // plans without inputs
@@ -392,10 +415,15 @@ impl LogicalPlan {
                 true
             }
             LogicalPlan::Limit(Limit { input, .. }) => input.accept(visitor)?,
+            LogicalPlan::Offset(Offset { input, .. }) => input.accept(visitor)?,
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => {
+                subquery.accept(visitor)?
+            }
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
                 input.accept(visitor)?
             }
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => {
                 input.accept(visitor)?
             }
             LogicalPlan::Extension(extension) => {
@@ -440,21 +468,20 @@ impl LogicalPlan {
     ///       CsvScan: employee projection=Some([0, 3])
     /// ```
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent
     /// let display_string = format!("{}", plan.display_indent());
     ///
-    /// assert_eq!("Filter: #foo_csv.id = Int32(5)\
-    ///              \n  TableScan: foo_csv projection=None",
+    /// assert_eq!("Filter: #t1.id = Int32(5)\n  TableScan: t1 projection=None",
     ///             display_string);
     /// ```
     pub fn display_indent(&self) -> impl fmt::Display + '_ {
@@ -481,21 +508,21 @@ impl LogicalPlan {
     ///      TableScan: employee projection=Some([0, 3]) [id:Int32, state:Utf8]";
     /// ```
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent_schema
     /// let display_string = format!("{}", plan.display_indent_schema());
     ///
-    /// assert_eq!("Filter: #foo_csv.id = Int32(5) [id:Int32]\
-    ///             \n  TableScan: foo_csv projection=None [id:Int32]",
+    /// assert_eq!("Filter: #t1.id = Int32(5) [id:Int32]\
+    ///             \n  TableScan: t1 projection=None [id:Int32]",
     ///             display_string);
     /// ```
     pub fn display_indent_schema(&self) -> impl fmt::Display + '_ {
@@ -521,13 +548,13 @@ impl LogicalPlan {
     /// This currently produces two graphs -- one with the basic
     /// structure, and one with additional details such as schema.
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
@@ -580,19 +607,19 @@ impl LogicalPlan {
     /// ```text
     /// Projection: #id
     /// ```
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display
     /// let display_string = format!("{}", plan.display());
     ///
-    /// assert_eq!("TableScan: foo.csv projection=None", display_string);
+    /// assert_eq!("TableScan: t1 projection=None", display_string);
     /// ```
     pub fn display(&self) -> impl fmt::Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
@@ -629,10 +656,22 @@ impl LogicalPlan {
                         ref limit,
                         ..
                     }) => {
+                        let projected_fields = match projection {
+                            Some(indices) => {
+                                let schema = source.schema();
+                                let names: Vec<&str> = indices
+                                    .iter()
+                                    .map(|i| schema.field(*i).name().as_str())
+                                    .collect();
+                                format!("Some([{}])", names.join(", "))
+                            }
+                            _ => "None".to_string(),
+                        };
+
                         write!(
                             f,
-                            "TableScan: {} projection={:?}",
-                            table_name, projection
+                            "TableScan: {} projection={}",
+                            table_name, projected_fields
                         )?;
 
                         if !filters.is_empty() {
@@ -722,22 +761,34 @@ impl LogicalPlan {
                     }
                     LogicalPlan::Join(Join {
                         on: ref keys,
+                        filter,
                         join_constraint,
                         join_type,
                         ..
                     }) => {
                         let join_expr: Vec<String> =
                             keys.iter().map(|(l, r)| format!("{} = {}", l, r)).collect();
+                        let filter_expr = filter
+                            .as_ref()
+                            .map(|expr| format!(" Filter: {}", expr))
+                            .unwrap_or_else(|| "".to_string());
                         match join_constraint {
                             JoinConstraint::On => {
-                                write!(f, "{} Join: {}", join_type, join_expr.join(", "))
+                                write!(
+                                    f,
+                                    "{} Join: {}{}",
+                                    join_type,
+                                    join_expr.join(", "),
+                                    filter_expr
+                                )
                             }
                             JoinConstraint::Using => {
                                 write!(
                                     f,
-                                    "{} Join: Using {}",
+                                    "{} Join: Using {}{}",
                                     join_type,
-                                    join_expr.join(", ")
+                                    join_expr.join(", "),
+                                    filter_expr,
                                 )
                             }
                         }
@@ -766,6 +817,12 @@ impl LogicalPlan {
                         }
                     },
                     LogicalPlan::Limit(Limit { ref n, .. }) => write!(f, "Limit: {}", n),
+                    LogicalPlan::Offset(Offset { ref offset, .. }) => {
+                        write!(f, "Offset: {}", offset)
+                    }
+                    LogicalPlan::Subquery(Subquery { subquery, .. }) => {
+                        write!(f, "Subquery: {:?}", subquery)
+                    }
                     LogicalPlan::SubqueryAlias(SubqueryAlias { ref alias, .. }) => {
                         write!(f, "SubqueryAlias: {}", alias)
                     }
@@ -779,6 +836,9 @@ impl LogicalPlan {
                         name, ..
                     }) => {
                         write!(f, "CreateMemoryTable: {:?}", name)
+                    }
+                    LogicalPlan::CreateView(CreateView { name, .. }) => {
+                        write!(f, "CreateView: {:?}", name)
                     }
                     LogicalPlan::CreateCatalogSchema(CreateCatalogSchema {
                         schema_name,
@@ -1021,6 +1081,19 @@ pub struct CreateMemoryTable {
     pub input: Arc<LogicalPlan>,
     /// Option to not error if table already exists
     pub if_not_exists: bool,
+    /// Option to replace table content if table already exists
+    pub or_replace: bool,
+}
+
+/// Creates a view.
+#[derive(Clone)]
+pub struct CreateView {
+    /// The table name
+    pub name: String,
+    /// The logical plan
+    pub input: Arc<LogicalPlan>,
+    /// Option to not error if table already exists
+    pub or_replace: bool,
 }
 
 /// Types of files to parse as DataFrames
@@ -1099,6 +1172,15 @@ pub struct Limit {
     pub input: Arc<LogicalPlan>,
 }
 
+/// Adjusts the starting point at which the rest of the expressions begin to effect
+#[derive(Clone)]
+pub struct Offset {
+    /// The offset
+    pub offset: usize,
+    /// The logical plan
+    pub input: Arc<LogicalPlan>,
+}
+
 /// Aggregates its input based on a set of grouping and aggregate
 /// expressions (e.g. SUM).
 #[derive(Clone)]
@@ -1131,6 +1213,8 @@ pub struct Join {
     pub right: Arc<LogicalPlan>,
     /// Equijoin clause expressed as pairs of (left, right) join columns
     pub on: Vec<(Column, Column)>,
+    /// Filters applied during join (non-equi conditions)
+    pub filter: Option<Expr>,
     /// Join type
     pub join_type: JoinType,
     /// Join constraint
@@ -1139,6 +1223,38 @@ pub struct Join {
     pub schema: DFSchemaRef,
     /// If null_equals_null is true, null == null else null != null
     pub null_equals_null: bool,
+}
+
+/// Subquery
+#[derive(Clone)]
+pub struct Subquery {
+    /// The subquery
+    pub subquery: Arc<LogicalPlan>,
+}
+
+impl Debug for Subquery {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Subquery: {:?}", self.subquery)
+    }
+}
+
+impl Hash for Subquery {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.finish();
+    }
+
+    fn hash_slice<H: Hasher>(_data: &[Self], state: &mut H)
+    where
+        Self: Sized,
+    {
+        state.finish();
+    }
+}
+
+impl PartialEq for Subquery {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 /// Logical partitioning schemes supported by the repartition operator.

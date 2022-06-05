@@ -35,9 +35,6 @@ list to help you get started.
 
 This section describes how you can get started at developing DataFusion.
 
-For information on developing with Ballista, see the
-[Ballista developer documentation](ballista/docs/README.md).
-
 ### Bootstrap environment
 
 DataFusion is written in Rust and it uses a standard rust toolkit:
@@ -52,6 +49,16 @@ Testing setup:
 - `rustup update stable` DataFusion uses the latest stable release of rust
 - `git submodule init`
 - `git submodule update`
+
+Formatting instructions:
+
+- [ci/scripts/rust_fmt.sh](ci/scripts/rust_fmt.sh)
+- [ci/scripts/rust_clippy.sh](ci/scripts/rust_clippy.sh)
+- [ci/scripts/rust_toml_fmt.sh](ci/scripts/rust_toml_fmt.sh)
+
+or run them all at once:
+
+- [dev/rust_lint.sh](dev/rust_lint.sh)
 
 ## Test Organization
 
@@ -150,7 +157,7 @@ The parquet SQL benchmarks can be run with
  cargo bench --bench parquet_query_sql
 ```
 
-These randomly generate a parquet file, and then benchmark queries sourced from [parquet_query_sql.sql](./datafusion/benches/parquet_query_sql.sql) against it. This can therefore be a quick way to add coverage of particular query and/or data paths.
+These randomly generate a parquet file, and then benchmark queries sourced from [parquet_query_sql.sql](./datafusion/core/benches/parquet_query_sql.sql) against it. This can therefore be a quick way to add coverage of particular query and/or data paths.
 
 If the environment variable `PARQUET_FILE` is set, the benchmark will run queries against this file instead of a randomly generated one. This can be useful for performing multiple runs, potentially with different code, against the same source data, or for testing against a custom dataset.
 
@@ -158,7 +165,7 @@ The benchmark will automatically remove any generated parquet file on exit, howe
 
 ### Upstream Benchmark Suites
 
-Instructions and tooling for running upstream benchmark suites against DataFusion and/or Ballista can be found in [benchmarks](./benchmarks).
+Instructions and tooling for running upstream benchmark suites against DataFusion can be found in [benchmarks](./benchmarks).
 
 These are valuable for comparative evaluation against alternative Arrow implementations and query engines.
 
@@ -167,21 +174,21 @@ These are valuable for comparative evaluation against alternative Arrow implemen
 Below is a checklist of what you need to do to add a new scalar function to DataFusion:
 
 - Add the actual implementation of the function:
-  - [here](datafusion/src/physical_plan/string_expressions.rs) for string functions
-  - [here](datafusion/src/physical_plan/math_expressions.rs) for math functions
-  - [here](datafusion/src/physical_plan/datetime_expressions.rs) for datetime functions
-  - create a new module [here](datafusion/src/physical_plan) for other functions
-- In [src/physical_plan/functions](datafusion/src/physical_plan/functions.rs), add:
+  - [here](datafusion/physical-expr/src/string_expressions.rs) for string functions
+  - [here](datafusion/physical-expr/src/math_expressions.rs) for math functions
+  - [here](datafusion/physical-expr/src/datetime_expressions.rs) for datetime functions
+  - create a new module [here](datafusion/physical-expr/src) for other functions
+- In [core/src/physical_plan](datafusion/core/src/physical_plan/functions.rs), add:
   - a new variant to `BuiltinScalarFunction`
   - a new entry to `FromStr` with the name of the function as called by SQL
   - a new line in `return_type` with the expected return type of the function, given an incoming type
   - a new line in `signature` with the signature of the function (number and types of its arguments)
   - a new line in `create_physical_expr`/`create_physical_fun` mapping the built-in to the implementation
   - tests to the function.
-- In [tests/sql.rs](datafusion/tests/sql.rs), add a new test where the function is called through SQL against well known data and returns the expected result.
-- In [src/logical_plan/expr](datafusion/src/logical_plan/expr.rs), add:
+- In [core/tests/sql](datafusion/core/tests/sql), add a new test where the function is called through SQL against well known data and returns the expected result.
+- In [core/src/logical_plan/expr](datafusion/core/src/logical_plan/expr.rs), add:
   - a new entry of the `unary_scalar_expr!` macro for the new function.
-- In [src/logical_plan/mod](datafusion/src/logical_plan/mod.rs), add:
+- In [core/src/logical_plan/mod](datafusion/core/src/logical_plan/mod.rs), add:
   - a new entry in the `pub use expr::{}` set.
 
 ## How to add a new aggregate function
@@ -253,5 +260,5 @@ $ prettier --version
 After you've confirmed your prettier version, you can format all the `.md` files:
 
 ```bash
-prettier -w {ballista,datafusion,datafusion-examples,dev,docs,python}/**/*.md
+prettier -w {datafusion,datafusion-cli,datafusion-examples,dev,docs}/**/*.md
 ```

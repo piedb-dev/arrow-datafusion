@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arrow::array::GenericStringArray;
 use arrow::array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, StringOffsetSizeTrait, UInt16Array, UInt32Array, UInt64Array,
+    Int64Array, Int8Array, OffsetSizeTrait, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
 use arrow::datatypes::ArrowPrimitiveType;
@@ -250,14 +250,14 @@ fn not_in_list_primitive<T: ArrowPrimitiveType>(
 }
 
 // whether each value on the left (can be null) is contained in the non-null list
-fn in_list_utf8<OffsetSize: StringOffsetSizeTrait>(
+fn in_list_utf8<OffsetSize: OffsetSizeTrait>(
     array: &GenericStringArray<OffsetSize>,
     values: &[&str],
 ) -> Result<BooleanArray> {
     compare_op_scalar!(array, values, |x, v: &[&str]| v.contains(&x))
 }
 
-fn not_in_list_utf8<OffsetSize: StringOffsetSizeTrait>(
+fn not_in_list_utf8<OffsetSize: OffsetSizeTrait>(
     array: &GenericStringArray<OffsetSize>,
     values: &[&str],
 ) -> Result<BooleanArray> {
@@ -341,7 +341,7 @@ impl InListExpr {
 
     /// Compare for specific utf8 types
     #[allow(clippy::unnecessary_wraps)]
-    fn compare_utf8<T: StringOffsetSizeTrait>(
+    fn compare_utf8<T: OffsetSizeTrait>(
         &self,
         array: ArrayRef,
         list_values: Vec<ColumnarValue>,
@@ -628,6 +628,10 @@ impl PhysicalExpr for InListExpr {
                 }
                 DataType::LargeUtf8 => {
                     self.compare_utf8::<i64>(array, list_values, self.negated)
+                }
+                DataType::Null => {
+                    let null_array = new_null_array(&DataType::Boolean, array.len());
+                    Ok(ColumnarValue::Array(Arc::new(null_array)))
                 }
                 datatype => Result::Err(DataFusionError::NotImplemented(format!(
                     "InList does not support datatype {:?}.",

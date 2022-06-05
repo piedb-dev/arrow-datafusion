@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::logical_plan::{LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::logical_plan::{provider_as_source, LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::test_util::scan_empty;
 use tempfile::TempDir;
 
 use super::*;
@@ -27,7 +28,14 @@ async fn projection_same_fields() -> Result<()> {
     let sql = "select (1+1) as a from (select 1 as a) as b;";
     let actual = execute_to_batches(&ctx, sql).await;
 
-    let expected = vec!["+---+", "| a |", "+---+", "| 2 |", "+---+"];
+    #[rustfmt::skip]
+    let expected = vec![
+        "+---+",
+        "| a |",
+        "+---+",
+        "| 2 |",
+        "+---+"
+    ];
     assert_batches_eq!(expected, &actual);
 
     Ok(())
@@ -135,13 +143,31 @@ async fn parallel_projection() -> Result<()> {
 }
 
 #[tokio::test]
+async fn subquery_alias_case_insensitive() -> Result<()> {
+    let partition_count = 1;
+    let results =
+        partitioned_csv::execute("SELECT V1.c1, v1.C2 FROM (SELECT test.C1, TEST.c2 FROM test) V1 ORDER BY v1.c1, V1.C2 LIMIT 1", partition_count).await?;
+
+    let expected = vec![
+        "+----+----+",
+        "| c1 | c2 |",
+        "+----+----+",
+        "| 0  | 1  |",
+        "+----+----+",
+    ];
+    assert_batches_sorted_eq!(expected, &results);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn projection_on_table_scan() -> Result<()> {
     let tmp_dir = TempDir::new()?;
     let partition_count = 4;
     let ctx = partitioned_csv::create_ctx(&tmp_dir, partition_count).await?;
 
     let table = ctx.table("test")?;
-    let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan())
+    let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan()?)
         .project(vec![col("c2")])?
         .build()?;
 
@@ -162,7 +188,7 @@ async fn projection_on_table_scan() -> Result<()> {
     }
 
     let expected = "Projection: #test.c2\
-                    \n  TableScan: test projection=Some([1])";
+                    \n  TableScan: test projection=Some([c2])";
     assert_eq!(format!("{:?}", optimized_plan), expected);
 
     let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
@@ -184,7 +210,7 @@ async fn preserve_nullability_on_projection() -> Result<()> {
     let schema: Schema = ctx.table("test").unwrap().schema().clone().into();
     assert!(!schema.field_with_name("c1")?.is_nullable());
 
-    let plan = LogicalPlanBuilder::scan_empty(None, &schema, None)?
+    let plan = scan_empty(None, &schema, None)?
         .project(vec![col("c1")])?
         .build()?;
 
@@ -212,9 +238,11 @@ async fn projection_on_memory_scan() -> Result<()> {
         ],
     )?]];
 
-    let plan = LogicalPlanBuilder::scan_memory(partitions, schema, None)?
-        .project(vec![col("b")])?
-        .build()?;
+    let provider = Arc::new(MemTable::try_new(schema, partitions)?);
+    let plan =
+        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(provider), None)?
+            .project(vec![col("b")])?
+            .build()?;
     assert_fields_eq(&plan, vec!["b"]);
 
     let ctx = SessionContext::new();
@@ -236,7 +264,7 @@ async fn projection_on_memory_scan() -> Result<()> {
 
     let expected = format!(
         "Projection: #{}.b\
-         \n  TableScan: {} projection=Some([1])",
+         \n  TableScan: {} projection=Some([b])",
         UNNAMED_TABLE, UNNAMED_TABLE
     );
     assert_eq!(format!("{:?}", optimized_plan), expected);

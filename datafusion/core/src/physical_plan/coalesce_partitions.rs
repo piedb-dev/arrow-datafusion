@@ -25,8 +25,6 @@ use std::task::Poll;
 use futures::Stream;
 use tokio::sync::mpsc;
 
-use async_trait::async_trait;
-
 use arrow::record_batch::RecordBatch;
 use arrow::{datatypes::SchemaRef, error::Result as ArrowResult};
 
@@ -66,7 +64,6 @@ impl CoalescePartitionsExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for CoalescePartitionsExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -101,7 +98,7 @@ impl ExecutionPlan for CoalescePartitionsExec {
         Ok(Arc::new(CoalescePartitionsExec::new(children[0].clone())))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -121,7 +118,7 @@ impl ExecutionPlan for CoalescePartitionsExec {
             )),
             1 => {
                 // bypass any threading / metrics if there is a single partition
-                self.input.execute(0, context).await
+                self.input.execute(0, context)
             }
             _ => {
                 let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
@@ -212,47 +209,29 @@ mod tests {
     use futures::FutureExt;
 
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
-    use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
     use crate::physical_plan::{collect, common};
     use crate::prelude::SessionContext;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
     use crate::test::{self, assert_is_pending};
-    use crate::test_util;
 
     #[tokio::test]
     async fn merge() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
 
         let num_partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", num_partitions)?;
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: schema,
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let csv = test::scan_partitioned_csv(num_partitions)?;
 
         // input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let merge = CoalescePartitionsExec::new(Arc::new(csv));
+        let merge = CoalescePartitionsExec::new(csv);
 
         // output of CoalescePartitionsExec should have a single partition
         assert_eq!(merge.output_partitioning().partition_count(), 1);
 
         // the result should contain 4 batches (one per input partition)
-        let iter = merge.execute(0, task_ctx).await?;
+        let iter = merge.execute(0, task_ctx)?;
         let batches = common::collect(iter).await?;
         assert_eq!(batches.len(), num_partitions);
 

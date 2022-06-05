@@ -241,17 +241,17 @@ mod tests {
 
     use super::*;
     use crate::datasource::listing::PartitionedFile;
+    use crate::datasource::object_store::ObjectStoreUrl;
+    use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
     use crate::physical_plan::expressions::{col, PhysicalSortExpr};
     use crate::physical_plan::file_format::{FileScanConfig, ParquetExec};
     use crate::physical_plan::filter::FilterExec;
-    use crate::physical_plan::hash_aggregate::{AggregateMode, HashAggregateExec};
     use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
     use crate::physical_plan::projection::ProjectionExec;
     use crate::physical_plan::sorts::sort::SortExec;
     use crate::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use crate::physical_plan::union::UnionExec;
     use crate::physical_plan::{displayable, Statistics};
-    use crate::test::object_store::TestObjectStore;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]))
@@ -260,7 +260,7 @@ mod tests {
     fn parquet_exec() -> Arc<ParquetExec> {
         Arc::new(ParquetExec::new(
             FileScanConfig {
-                object_store: TestObjectStore::new_arc(&[("x", 100)]),
+                object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
                 file_schema: schema(),
                 file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
                 statistics: Statistics::default(),
@@ -300,15 +300,15 @@ mod tests {
         Arc::new(ProjectionExec::try_new(exprs, input).unwrap())
     }
 
-    fn hash_aggregate(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    fn aggregate(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let schema = schema();
         Arc::new(
-            HashAggregateExec::try_new(
+            AggregateExec::try_new(
                 AggregateMode::Final,
                 vec![],
                 vec![],
                 Arc::new(
-                    HashAggregateExec::try_new(
+                    AggregateExec::try_new(
                         AggregateMode::Partial,
                         vec![],
                         vec![],
@@ -361,11 +361,11 @@ mod tests {
 
     #[test]
     fn added_repartition_to_single_partition() -> Result<()> {
-        let plan = hash_aggregate(parquet_exec());
+        let plan = aggregate(parquet_exec());
 
         let expected = [
-            "HashAggregateExec: mode=Final, gby=[], aggr=[]",
-            "HashAggregateExec: mode=Partial, gby=[], aggr=[]",
+            "AggregateExec: mode=Final, gby=[], aggr=[]",
+            "AggregateExec: mode=Partial, gby=[], aggr=[]",
             "RepartitionExec: partitioning=RoundRobinBatch(10)",
             "ParquetExec: limit=None, partitions=[x], projection=[c1]",
         ];
@@ -376,11 +376,11 @@ mod tests {
 
     #[test]
     fn repartition_deepest_node() -> Result<()> {
-        let plan = hash_aggregate(filter_exec(parquet_exec()));
+        let plan = aggregate(filter_exec(parquet_exec()));
 
         let expected = &[
-            "HashAggregateExec: mode=Final, gby=[], aggr=[]",
-            "HashAggregateExec: mode=Partial, gby=[], aggr=[]",
+            "AggregateExec: mode=Final, gby=[], aggr=[]",
+            "AggregateExec: mode=Partial, gby=[], aggr=[]",
             "FilterExec: c1@0",
             "RepartitionExec: partitioning=RoundRobinBatch(10)",
             "ParquetExec: limit=None, partitions=[x], projection=[c1]",
@@ -443,11 +443,11 @@ mod tests {
 
     #[test]
     fn repartition_ignores_limit() -> Result<()> {
-        let plan = hash_aggregate(limit_exec(filter_exec(limit_exec(parquet_exec()))));
+        let plan = aggregate(limit_exec(filter_exec(limit_exec(parquet_exec()))));
 
         let expected = &[
-            "HashAggregateExec: mode=Final, gby=[], aggr=[]",
-            "HashAggregateExec: mode=Partial, gby=[], aggr=[]",
+            "AggregateExec: mode=Final, gby=[], aggr=[]",
+            "AggregateExec: mode=Partial, gby=[], aggr=[]",
             "RepartitionExec: partitioning=RoundRobinBatch(10)",
             "GlobalLimitExec: limit=100",
             "LocalLimitExec: limit=100",

@@ -54,6 +54,8 @@ pub enum BuiltinScalarFunction {
     Log10,
     /// log2
     Log2,
+    /// power
+    Power,
     /// round
     Round,
     /// signum
@@ -156,6 +158,8 @@ pub enum BuiltinScalarFunction {
     Upper,
     /// regexp_match
     RegexpMatch,
+    ///struct
+    Struct,
 }
 
 impl BuiltinScalarFunction {
@@ -184,6 +188,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::Log => Volatility::Immutable,
             BuiltinScalarFunction::Log10 => Volatility::Immutable,
             BuiltinScalarFunction::Log2 => Volatility::Immutable,
+            BuiltinScalarFunction::Power => Volatility::Immutable,
             BuiltinScalarFunction::Round => Volatility::Immutable,
             BuiltinScalarFunction::Signum => Volatility::Immutable,
             BuiltinScalarFunction::Sin => Volatility::Immutable,
@@ -233,6 +238,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::Trim => Volatility::Immutable,
             BuiltinScalarFunction::Upper => Volatility::Immutable,
             BuiltinScalarFunction::RegexpMatch => Volatility::Immutable,
+            BuiltinScalarFunction::Struct => Volatility::Immutable,
 
             // Stable builtin functions
             BuiltinScalarFunction::Now => Volatility::Stable,
@@ -267,6 +273,7 @@ impl FromStr for BuiltinScalarFunction {
             "log" => BuiltinScalarFunction::Log,
             "log10" => BuiltinScalarFunction::Log10,
             "log2" => BuiltinScalarFunction::Log2,
+            "power" => BuiltinScalarFunction::Power,
             "round" => BuiltinScalarFunction::Round,
             "signum" => BuiltinScalarFunction::Signum,
             "sin" => BuiltinScalarFunction::Sin,
@@ -325,6 +332,7 @@ impl FromStr for BuiltinScalarFunction {
             "trim" => BuiltinScalarFunction::Trim,
             "upper" => BuiltinScalarFunction::Upper,
             "regexp_match" => BuiltinScalarFunction::RegexpMatch,
+            "struct" => BuiltinScalarFunction::Struct,
             _ => {
                 return Err(DataFusionError::Plan(format!(
                     "There is no built-in function named {}",

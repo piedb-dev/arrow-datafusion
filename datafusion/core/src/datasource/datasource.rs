@@ -21,10 +21,11 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion_expr::{TableProviderFilterPushDown, TableType};
+pub use datafusion_expr::{TableProviderFilterPushDown, TableType};
 
 use crate::arrow::datatypes::SchemaRef;
 use crate::error::Result;
+use crate::execution::context::SessionState;
 use crate::logical_plan::Expr;
 use crate::physical_plan::ExecutionPlan;
 
@@ -39,9 +40,7 @@ pub trait TableProvider: Sync + Send {
     fn schema(&self) -> SchemaRef;
 
     /// Get the type of this table for metadata/catalog purposes.
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
+    fn table_type(&self) -> TableType;
 
     /// Create an ExecutionPlan that will scan the table.
     /// The table provider will be usually responsible of grouping
@@ -49,6 +48,7 @@ pub trait TableProvider: Sync + Send {
     /// parallelized or distributed.
     async fn scan(
         &self,
+        ctx: &SessionState,
         projection: &Option<Vec<usize>>,
         filters: &[Expr],
         // limit can be used to reduce the amount scanned

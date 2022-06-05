@@ -46,6 +46,11 @@ use datafusion::{
 };
 use datafusion::{execution::context::SessionContext, physical_plan::displayable};
 use datafusion_expr::Volatility;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+use tempfile::TempDir;
+use url::Url;
 
 /// A macro to assert that some particular line contains two substrings
 ///
@@ -177,6 +182,7 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t1_schema = Arc::new(Schema::new(vec![
         Field::new(column_left, DataType::UInt32, true),
         Field::new("t1_name", DataType::Utf8, true),
+        Field::new("t1_int", DataType::UInt32, true),
     ]));
     let t1_data = RecordBatch::try_new(
         t1_schema.clone(),
@@ -188,6 +194,7 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
                 Some("c"),
                 Some("d"),
             ])),
+            Arc::new(UInt32Array::from_slice(&[1, 2, 3, 4])),
         ],
     )?;
     let t1_table = MemTable::try_new(t1_schema, vec![vec![t1_data]])?;
@@ -196,6 +203,7 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
     let t2_schema = Arc::new(Schema::new(vec![
         Field::new(column_right, DataType::UInt32, true),
         Field::new("t2_name", DataType::Utf8, true),
+        Field::new("t2_int", DataType::UInt32, true),
     ]));
     let t2_data = RecordBatch::try_new(
         t2_schema.clone(),
@@ -207,6 +215,7 @@ fn create_join_context(column_left: &str, column_right: &str) -> Result<SessionC
                 Some("x"),
                 Some("w"),
             ])),
+            Arc::new(UInt32Array::from_slice(&[3, 1, 3, 3])),
         ],
     )?;
     let t2_table = MemTable::try_new(t2_schema, vec![vec![t2_data]])?;
@@ -532,19 +541,32 @@ async fn plan_and_collect(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordB
 /// Execute query and return results as a Vec of RecordBatches
 async fn execute_to_batches(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
     let msg = format!("Creating logical plan for '{}'", sql);
-    let plan = ctx.create_logical_plan(sql).expect(&msg);
+    let plan = ctx
+        .create_logical_plan(sql)
+        .map_err(|e| format!("{:?} at {}", e, msg))
+        .unwrap();
     let logical_schema = plan.schema();
 
     let msg = format!("Optimizing logical plan for '{}': {:?}", sql, plan);
-    let plan = ctx.optimize(&plan).expect(&msg);
+    let plan = ctx
+        .optimize(&plan)
+        .map_err(|e| format!("{:?} at {}", e, msg))
+        .unwrap();
     let optimized_logical_schema = plan.schema();
 
     let msg = format!("Creating physical plan for '{}': {:?}", sql, plan);
-    let plan = ctx.create_physical_plan(&plan).await.expect(&msg);
+    let plan = ctx
+        .create_physical_plan(&plan)
+        .await
+        .map_err(|e| format!("{:?} at {}", e, msg))
+        .unwrap();
 
     let msg = format!("Executing physical plan for '{}': {:?}", sql, plan);
     let task_ctx = ctx.task_ctx();
-    let results = collect(plan, task_ctx).await.expect(&msg);
+    let results = collect(plan, task_ctx)
+        .await
+        .map_err(|e| format!("{:?} at {}", e, msg))
+        .unwrap();
 
     assert_eq!(logical_schema.as_ref(), optimized_logical_schema.as_ref());
     results
@@ -554,6 +576,98 @@ async fn execute_to_batches(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch>
 /// `result[row][column]`
 async fn execute(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
     result_vec(&execute_to_batches(ctx, sql).await)
+}
+
+/// Execute SQL and return results
+async fn execute_with_partition(
+    sql: &str,
+    partition_count: usize,
+) -> Result<Vec<RecordBatch>> {
+    let tmp_dir = TempDir::new()?;
+    let ctx = create_ctx_with_partition(&tmp_dir, partition_count).await?;
+    plan_and_collect(&ctx, sql).await
+}
+
+/// Generate a partitioned CSV file and register it with an execution context
+async fn create_ctx_with_partition(
+    tmp_dir: &TempDir,
+    partition_count: usize,
+) -> Result<SessionContext> {
+    let ctx = SessionContext::with_config(SessionConfig::new().with_target_partitions(8));
+
+    let schema = populate_csv_partitions(tmp_dir, partition_count, ".csv")?;
+
+    // register csv file with the execution context
+    ctx.register_csv(
+        "test",
+        tmp_dir.path().to_str().unwrap(),
+        CsvReadOptions::new().schema(&schema),
+    )
+    .await?;
+
+    Ok(ctx)
+}
+
+/// Generate CSV partitions within the supplied directory
+fn populate_csv_partitions(
+    tmp_dir: &TempDir,
+    partition_count: usize,
+    file_extension: &str,
+) -> Result<SchemaRef> {
+    // define schema for data source (csv file)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c1", DataType::UInt32, false),
+        Field::new("c2", DataType::UInt64, false),
+        Field::new("c3", DataType::Boolean, false),
+    ]));
+
+    // generate a partitioned file
+    for partition in 0..partition_count {
+        let filename = format!("partition-{}.{}", partition, file_extension);
+        let file_path = tmp_dir.path().join(&filename);
+        let mut file = File::create(file_path)?;
+
+        // generate some data
+        for i in 0..=10 {
+            let data = format!("{},{},{}\n", partition, i, i % 2 == 0);
+            file.write_all(data.as_bytes())?;
+        }
+    }
+
+    Ok(schema)
+}
+
+/// Return a new table which provide this decimal column
+pub fn table_with_decimal() -> Arc<dyn TableProvider> {
+    let batch_decimal = make_decimal();
+    let schema = batch_decimal.schema();
+    let partitions = vec![vec![batch_decimal]];
+    Arc::new(MemTable::try_new(schema, partitions).unwrap())
+}
+
+fn make_decimal() -> RecordBatch {
+    let mut decimal_builder = DecimalBuilder::new(20, 10, 3);
+    for i in 110000..110010 {
+        decimal_builder.append_value(i as i128).unwrap();
+    }
+    for i in 100000..100010 {
+        decimal_builder.append_value(-i as i128).unwrap();
+    }
+    let array = decimal_builder.finish();
+    let schema = Schema::new(vec![Field::new("c1", array.data_type().clone(), true)]);
+    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap()
+}
+
+/// Return a RecordBatch with a single Int32 array with values (0..sz)
+pub fn make_partition(sz: i32) -> RecordBatch {
+    let seq_start = 0;
+    let seq_end = sz;
+    let values = (seq_start..seq_end).collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
+    let arr = Arc::new(Int32Array::from(values));
+    let arr = arr as ArrayRef;
+
+    RecordBatch::try_new(schema, vec![arr]).unwrap()
 }
 
 /// Specialised String representation
@@ -699,25 +813,57 @@ pub fn table_with_sequence(
     Ok(Arc::new(MemTable::try_new(schema, partitions)?))
 }
 
-// Normalizes parts of an explain plan that vary from run to run (such as path)
-fn normalize_for_explain(s: &str) -> String {
-    // Convert things like /Users/alamb/Software/arrow/testing/data/csv/aggregate_test_100.csv
-    // to ARROW_TEST_DATA/csv/aggregate_test_100.csv
-    let data_path = datafusion::test_util::arrow_test_data();
-    let s = s.replace(&data_path, "ARROW_TEST_DATA");
+pub struct ExplainNormalizer {
+    replacements: Vec<(String, String)>,
+}
 
-    // convert things like partitioning=RoundRobinBatch(16)
-    // to partitioning=RoundRobinBatch(NUM_CORES)
-    let needle = format!("RoundRobinBatch({})", num_cpus::get());
-    s.replace(&needle, "RoundRobinBatch(NUM_CORES)")
+impl ExplainNormalizer {
+    fn new() -> Self {
+        let mut replacements = vec![];
+
+        let mut push_path = |path: PathBuf, key: &str| {
+            // Push path as is
+            replacements.push((path.to_string_lossy().to_string(), key.to_string()));
+
+            // Push canonical version of path
+            let canonical = path.canonicalize().unwrap();
+            replacements.push((canonical.to_string_lossy().to_string(), key.to_string()));
+
+            if cfg!(target_family = "windows") {
+                // Push URL representation of path, to handle windows
+                let url = Url::from_file_path(canonical).unwrap();
+                let path = url.path().strip_prefix('/').unwrap();
+                replacements.push((path.to_string(), key.to_string()));
+            }
+        };
+
+        push_path(test_util::arrow_test_data().into(), "ARROW_TEST_DATA");
+        push_path(std::env::current_dir().unwrap(), "WORKING_DIR");
+
+        // convert things like partitioning=RoundRobinBatch(16)
+        // to partitioning=RoundRobinBatch(NUM_CORES)
+        let needle = format!("RoundRobinBatch({})", num_cpus::get());
+        replacements.push((needle, "RoundRobinBatch(NUM_CORES)".to_string()));
+
+        Self { replacements }
+    }
+
+    fn normalize(&self, s: impl Into<String>) -> String {
+        let mut s = s.into();
+        for (from, to) in &self.replacements {
+            s = s.replace(from, to);
+        }
+        s
+    }
 }
 
 /// Applies normalize_for_explain to every line
 fn normalize_vec_for_explain(v: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let normalizer = ExplainNormalizer::new();
     v.into_iter()
         .map(|l| {
             l.into_iter()
-                .map(|s| normalize_for_explain(&s))
+                .map(|s| normalizer.normalize(s))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
@@ -836,7 +982,7 @@ async fn nyc() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_csv(
         "tripdata",
-        "file.csv",
+        "file:///file.csv",
         CsvReadOptions::new().schema(&schema),
     )
     .await?;

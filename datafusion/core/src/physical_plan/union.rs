@@ -38,7 +38,6 @@ use crate::{
     error::Result,
     physical_plan::{expressions, metrics::BaselineMetrics},
 };
-use async_trait::async_trait;
 
 /// UNION ALL execution plan
 #[derive(Debug)]
@@ -64,7 +63,6 @@ impl UnionExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for UnionExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -107,7 +105,7 @@ impl ExecutionPlan for UnionExec {
         Ok(Arc::new(UnionExec::new(children)))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         mut partition: usize,
         context: Arc<TaskContext>,
@@ -123,7 +121,7 @@ impl ExecutionPlan for UnionExec {
         for input in self.inputs.iter() {
             // Calculate whether partition belongs to the current partition
             if partition < input.output_partitioning().partition_count() {
-                let stream = input.execute(partition, context.clone()).await?;
+                let stream = input.execute(partition, context)?;
                 debug!("Found a Union partition to execute");
                 return Ok(Box::pin(ObservedStream::new(stream, baseline_metrics)));
             } else {
@@ -244,61 +242,22 @@ fn stats_union(mut left: Statistics, right: Statistics) -> Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion_data_access::object_store::{
-        local::LocalFileSystem, ObjectStore,
-    };
-    use crate::{test, test_util};
+    use crate::test;
 
     use crate::prelude::SessionContext;
-    use crate::{
-        physical_plan::{
-            collect,
-            file_format::{CsvExec, FileScanConfig},
-        },
-        scalar::ScalarValue,
-    };
+    use crate::{physical_plan::collect, scalar::ScalarValue};
     use arrow::record_batch::RecordBatch;
 
     #[tokio::test]
     async fn test_union_partitions() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
-        let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem {});
 
         // Create csv's with different partitioning
-        let (_, files) = test::create_partitioned_csv("aggregate_test_100.csv", 4)?;
-        let (_, files2) = test::create_partitioned_csv("aggregate_test_100.csv", 5)?;
+        let csv = test::scan_partitioned_csv(4)?;
+        let csv2 = test::scan_partitioned_csv(5)?;
 
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::clone(&fs),
-                file_schema: Arc::clone(&schema),
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
-
-        let csv2 = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::clone(&fs),
-                file_schema: Arc::clone(&schema),
-                file_groups: files2,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
-
-        let union_exec = Arc::new(UnionExec::new(vec![Arc::new(csv), Arc::new(csv2)]));
+        let union_exec = Arc::new(UnionExec::new(vec![csv, csv2]));
 
         // Should have 9 partitions and 9 output batches
         assert_eq!(union_exec.output_partitioning().partition_count(), 9);

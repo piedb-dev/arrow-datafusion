@@ -15,6 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! [DataFusion](https://github.com/apache/arrow-datafusion)
+//! is an extensible query execution framework that uses
+//! [Apache Arrow](https://arrow.apache.org) as its in-memory format.
+//!
+//! This crate is a submodule of DataFusion that provides types representing
+//! logical query plans ([LogicalPlan]) and logical expressions ([Expr]) as well as utilities for
+//! working with these types.
+//!
+//! The [expr_fn] module contains functions for creating expressions.
+
 mod accumulator;
 pub mod aggregate_function;
 pub mod array_expressions;
@@ -24,7 +34,9 @@ mod columnar_value;
 pub mod conditional_expressions;
 pub mod expr;
 pub mod expr_fn;
+pub mod expr_rewriter;
 pub mod expr_schema;
+pub mod expr_visitor;
 pub mod field_util;
 pub mod function;
 mod literal;
@@ -32,10 +44,12 @@ pub mod logical_plan;
 mod nullif;
 mod operator;
 mod signature;
+pub mod struct_expressions;
 mod table_source;
 pub mod type_coercion;
 mod udaf;
 mod udf;
+pub mod utils;
 pub mod window_frame;
 pub mod window_function;
 
@@ -44,24 +58,14 @@ pub use aggregate_function::AggregateFunction;
 pub use built_in_function::BuiltinScalarFunction;
 pub use columnar_value::{ColumnarValue, NullColumnarValue};
 pub use expr::Expr;
-pub use expr_fn::{
-    abs, acos, and, approx_distinct, approx_percentile_cont, array, ascii, asin, atan,
-    avg, bit_length, btrim, case, ceil, character_length, chr, coalesce, col, concat,
-    concat_expr, concat_ws, concat_ws_expr, cos, count, count_distinct, date_part,
-    date_trunc, digest, exp, floor, in_list, initcap, left, length, ln, log10, log2,
-    lower, lpad, ltrim, max, md5, min, now, now_expr, nullif, octet_length, or, random,
-    regexp_match, regexp_replace, repeat, replace, reverse, right, round, rpad, rtrim,
-    sha224, sha256, sha384, sha512, signum, sin, split_part, sqrt, starts_with, strpos,
-    substr, sum, tan, to_hex, to_timestamp_micros, to_timestamp_millis,
-    to_timestamp_seconds, translate, trim, trunc, upper, when,
-};
+pub use expr_fn::*;
 pub use expr_schema::ExprSchemable;
 pub use function::{
     AccumulatorFunctionImplementation, ReturnTypeFunction, ScalarFunctionImplementation,
     StateTypeFunction,
 };
 pub use literal::{lit, lit_timestamp_nano, Literal, TimestampLiteral};
-pub use logical_plan::{LogicalPlan, PlanVisitor};
+pub use logical_plan::{LogicalPlan, LogicalPlanBuilder, PlanVisitor};
 pub use nullif::SUPPORTED_NULLIF_TYPES;
 pub use operator::Operator;
 pub use signature::{Signature, TypeSignature, Volatility};

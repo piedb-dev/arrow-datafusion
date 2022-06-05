@@ -21,7 +21,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    datasource::TableProvider,
+    datasource::{TableProvider, TableType},
     error::Result,
     logical_plan::Expr,
     physical_plan::{
@@ -34,7 +34,7 @@ use datafusion::{
 };
 
 use async_trait::async_trait;
-use datafusion::execution::context::TaskContext;
+use datafusion::execution::context::{SessionState, TaskContext};
 
 /// This is a testing structure for statistics
 /// It will act both as a table provider and execution plan
@@ -68,8 +68,13 @@ impl TableProvider for StatisticsValidation {
         Arc::clone(&self.schema)
     }
 
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
     async fn scan(
         &self,
+        _ctx: &SessionState,
         projection: &Option<Vec<usize>>,
         filters: &[Expr],
         // limit is ignored because it is not mandatory for a `TableProvider` to honor it
@@ -106,7 +111,6 @@ impl TableProvider for StatisticsValidation {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for StatisticsValidation {
     fn as_any(&self) -> &dyn Any {
         self
@@ -135,7 +139,7 @@ impl ExecutionPlan for StatisticsValidation {
         Ok(self)
     }
 
-    async fn execute(
+    fn execute(
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
@@ -209,7 +213,7 @@ async fn sql_basic() -> Result<()> {
     let df = ctx.sql("SELECT * from stats_table").await.unwrap();
 
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan()?)
         .await
         .unwrap();
 
@@ -230,7 +234,7 @@ async fn sql_filter() -> Result<()> {
         .unwrap();
 
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan()?)
         .await
         .unwrap();
 
@@ -247,7 +251,7 @@ async fn sql_limit() -> Result<()> {
 
     let df = ctx.sql("SELECT * FROM stats_table LIMIT 5").await.unwrap();
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan()?)
         .await
         .unwrap();
     // when the limit is smaller than the original number of lines
@@ -266,7 +270,7 @@ async fn sql_limit() -> Result<()> {
         .await
         .unwrap();
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan()?)
         .await
         .unwrap();
     // when the limit is larger than the original number of lines, statistics remain unchanged
@@ -286,7 +290,7 @@ async fn sql_window() -> Result<()> {
         .unwrap();
 
     let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan())
+        .create_physical_plan(&df.to_logical_plan()?)
         .await
         .unwrap();
 

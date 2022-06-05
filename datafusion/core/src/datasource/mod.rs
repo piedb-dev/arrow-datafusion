@@ -23,13 +23,15 @@ pub mod empty;
 pub mod file_format;
 pub mod listing;
 pub mod memory;
-pub mod object_store_registry;
+pub mod object_store;
+pub mod view;
 
 use futures::Stream;
 
 pub use self::datasource::TableProvider;
 use self::listing::PartitionedFile;
 pub use self::memory::MemTable;
+pub use self::view::ViewTable;
 use crate::arrow::datatypes::{Schema, SchemaRef};
 use crate::error::Result;
 pub use crate::logical_expr::TableType;
@@ -76,6 +78,8 @@ pub async fn get_statistics_with_limit(
                                 max_values[i] = None;
                             }
                         }
+                    } else {
+                        max_values[i] = None;
                     }
                 }
 
@@ -87,6 +91,8 @@ pub async fn get_statistics_with_limit(
                                 min_values[i] = None;
                             }
                         }
+                    } else {
+                        min_values[i] = None;
                     }
                 }
             }

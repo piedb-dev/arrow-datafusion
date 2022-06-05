@@ -19,14 +19,10 @@
 //! some simple rules to a logical plan, such as "Projection Push Down" and "Type Coercion".
 
 #![allow(clippy::module_inception)]
-pub mod common_subexpr_eliminate;
-pub mod eliminate_filter;
-pub mod eliminate_limit;
-pub mod filter_push_down;
-pub mod limit_push_down;
-pub mod optimizer;
-pub mod projection_push_down;
 pub mod simplify_expressions;
-pub mod single_distinct_to_groupby;
-pub mod to_approx_perc;
-pub mod utils;
+
+pub use datafusion_optimizer::{
+    common_subexpr_eliminate, eliminate_filter, eliminate_limit, filter_push_down,
+    limit_push_down, optimizer, projection_push_down, single_distinct_to_groupby,
+    subquery_filter_to_join, utils,
+};

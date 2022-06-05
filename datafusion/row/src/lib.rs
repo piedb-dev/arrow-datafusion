@@ -30,10 +30,12 @@
 //!       we append their actual content to the end of the var length region and
 //!       store their offset relative to row base and their length, packed into an 8-byte word.
 //!
+//! ```plaintext
 //! ┌────────────────┬──────────────────────────┬───────────────────────┐        ┌───────────────────────┬────────────┐
 //! │Validity Bitmask│    Fixed Width Field     │ Variable Width Field  │   ...  │     vardata area      │  padding   │
 //! │ (byte aligned) │   (native type width)    │(vardata offset + len) │        │   (variable length)   │   bytes    │
 //! └────────────────┴──────────────────────────┴───────────────────────┘        └───────────────────────┴────────────┘
+//! ```
 //!
 //!  For example, given the schema (Int8, Utf8, Float32, Utf8)
 //!
@@ -41,19 +43,23 @@
 //!
 //!  Requires 32 bytes (31 bytes payload and 1 byte padding to make each tuple 8-bytes aligned):
 //!
+//! ```plaintext
 //! ┌──────────┬──────────┬──────────────────────┬──────────────┬──────────────────────┬───────────────────────┬──────────┐
 //! │0b00001011│   0x01   │0x00000016  0x00000006│  0x00000000  │0x0000001C  0x00000003│       FooBarbaz       │   0x00   │
 //! └──────────┴──────────┴──────────────────────┴──────────────┴──────────────────────┴───────────────────────┴──────────┘
 //! 0          1          2                     10              14                     22                     31         32
+//! ```
 //!
 
-use arrow::array::{make_builder, ArrayBuilder};
+use arrow::array::{make_builder, ArrayBuilder, ArrayRef};
 use arrow::datatypes::Schema;
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
+pub use layout::row_supported;
 pub use layout::RowType;
 use std::sync::Arc;
 
+pub mod accessor;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod layout;
@@ -84,6 +90,10 @@ impl MutableRecordBatch {
         let result = make_batch(self.schema.clone(), self.arrays.drain(..).collect());
         result
     }
+
+    pub fn output_as_columns(&mut self) -> Vec<ArrayRef> {
+        get_columns(self.arrays.drain(..).collect())
+    }
 }
 
 fn new_arrays(schema: &Schema, batch_size: usize) -> Vec<Box<dyn ArrayBuilder>> {
@@ -103,6 +113,10 @@ fn make_batch(
 ) -> ArrowResult<RecordBatch> {
     let columns = arrays.iter_mut().map(|array| array.finish()).collect();
     RecordBatch::try_new(schema, columns)
+}
+
+fn get_columns(mut arrays: Vec<Box<dyn ArrayBuilder>>) -> Vec<ArrayRef> {
+    arrays.iter_mut().map(|array| array.finish()).collect()
 }
 
 #[cfg(test)]
@@ -341,7 +355,7 @@ mod tests {
     );
 
     #[test]
-    #[should_panic(expected = "row_supported(schema, row_type)")]
+    #[should_panic(expected = "not supported yet")]
     fn test_unsupported_word_aligned_type() {
         let a: ArrayRef = Arc::new(StringArray::from(vec!["hello", "world"]));
         let batch = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
@@ -380,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "row_supported(schema, row_type)")]
+    #[should_panic(expected = "not supported yet")]
     fn test_unsupported_type_write() {
         let a: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let batch = RecordBatch::try_from_iter(vec![("a", a)]).unwrap();
@@ -390,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "row_supported(schema, row_type)")]
+    #[should_panic(expected = "not supported yet")]
     fn test_unsupported_type_read() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "a",

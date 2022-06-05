@@ -26,7 +26,6 @@ use crate::physical_plan::{
 
 use arrow::csv;
 use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use std::any::Any;
 use std::fs;
@@ -75,7 +74,6 @@ impl CsvExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for CsvExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -112,7 +110,7 @@ impl ExecutionPlan for CsvExec {
         Ok(self)
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -139,8 +137,12 @@ impl ExecutionPlan for CsvExec {
             )) as BatchIter
         };
 
+        let object_store = context
+            .runtime_env()
+            .object_store(&self.base_config.object_store_url)?;
+
         Ok(Box::pin(FileStream::new(
-            Arc::clone(&self.base_config.object_store),
+            object_store,
             self.base_config.file_groups[partition].clone(),
             fun,
             Arc::clone(&self.projected_schema),
@@ -191,7 +193,7 @@ pub async fn plan_to_csv(
                 let file = fs::File::create(path)?;
                 let mut writer = csv::Writer::new(file);
                 let task_ctx = Arc::new(TaskContext::from(state));
-                let stream = plan.execute(i, task_ctx).await?;
+                let stream = plan.execute(i, task_ctx)?;
                 let handle: JoinHandle<Result<()>> = task::spawn(async move {
                     stream
                         .map(|batch| writer.write(&batch?))
@@ -214,9 +216,8 @@ pub async fn plan_to_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
-    use crate::datasource::listing::local_unpartitioned_file;
     use crate::prelude::*;
+    use crate::test::partitioned_csv_config;
     use crate::test_util::aggr_test_schema_with_missing_col;
     use crate::{scalar::ScalarValue, test_util::aggr_test_schema};
     use arrow::datatypes::*;
@@ -230,27 +231,16 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
-        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
-        let path = format!("{}/csv/{}", testdata, filename);
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema,
-                file_groups: vec![vec![local_unpartitioned_file(path)]],
-                statistics: Statistics::default(),
-                projection: Some(vec![0, 2, 4]),
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        config.projection = Some(vec![0, 2, 4]);
+
+        let csv = CsvExec::new(config, true, b',');
         assert_eq!(13, csv.base_config.file_schema.fields().len());
         assert_eq!(3, csv.projected_schema.fields().len());
         assert_eq!(3, csv.schema().fields().len());
 
-        let mut stream = csv.execute(0, task_ctx).await?;
+        let mut stream = csv.execute(0, task_ctx)?;
         let batch = stream.next().await.unwrap()?;
         assert_eq!(3, batch.num_columns());
         assert_eq!(100, batch.num_rows());
@@ -277,27 +267,16 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
-        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
-        let path = format!("{}/csv/{}", testdata, filename);
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema,
-                file_groups: vec![vec![local_unpartitioned_file(path)]],
-                statistics: Statistics::default(),
-                projection: None,
-                limit: Some(5),
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        config.limit = Some(5);
+
+        let csv = CsvExec::new(config, true, b',');
         assert_eq!(13, csv.base_config.file_schema.fields().len());
         assert_eq!(13, csv.projected_schema.fields().len());
         assert_eq!(13, csv.schema().fields().len());
 
-        let mut it = csv.execute(0, task_ctx).await?;
+        let mut it = csv.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
         assert_eq!(13, batch.num_columns());
         assert_eq!(5, batch.num_rows());
@@ -324,27 +303,16 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema_with_missing_col();
-        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
-        let path = format!("{}/csv/{}", testdata, filename);
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema,
-                file_groups: vec![vec![local_unpartitioned_file(path)]],
-                statistics: Statistics::default(),
-                projection: None,
-                limit: Some(5),
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        config.limit = Some(5);
+
+        let csv = CsvExec::new(config, true, b',');
         assert_eq!(14, csv.base_config.file_schema.fields().len());
         assert_eq!(14, csv.projected_schema.fields().len());
         assert_eq!(14, csv.schema().fields().len());
 
-        let mut it = csv.execute(0, task_ctx).await?;
+        let mut it = csv.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
         assert_eq!(14, batch.num_columns());
         assert_eq!(5, batch.num_rows());
@@ -371,34 +339,26 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
-        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
+        let mut config = partitioned_csv_config(filename, file_schema.clone(), 1)?;
+
+        // Add partition columns
+        config.table_partition_cols = vec!["date".to_owned()];
+        config.file_groups[0][0].partition_values =
+            vec![ScalarValue::Utf8(Some("2021-10-26".to_owned()))];
+
+        // We should be able to project on the partition column
+        // Which is supposed to be after the file fields
+        config.projection = Some(vec![0, file_schema.fields().len()]);
+
         // we don't have `/date=xx/` in the path but that is ok because
         // partitions are resolved during scan anyway
-        let path = format!("{}/csv/{}", testdata, filename);
-        let mut partitioned_file = local_unpartitioned_file(path);
-        partitioned_file.partition_values =
-            vec![ScalarValue::Utf8(Some("2021-10-26".to_owned()))];
-        let csv = CsvExec::new(
-            FileScanConfig {
-                // we should be able to project on the partition column
-                // wich is supposed to be after the file fields
-                projection: Some(vec![0, file_schema.fields().len()]),
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema,
-                file_groups: vec![vec![partitioned_file]],
-                statistics: Statistics::default(),
-                limit: None,
-                table_partition_cols: vec!["date".to_owned()],
-            },
-            true,
-            b',',
-        );
+        let csv = CsvExec::new(config, true, b',');
         assert_eq!(13, csv.base_config.file_schema.fields().len());
         assert_eq!(2, csv.projected_schema.fields().len());
         assert_eq!(2, csv.schema().fields().len());
 
-        let mut it = csv.execute(0, task_ctx).await?;
+        let mut it = csv.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
         assert_eq!(2, batch.num_columns());
         assert_eq!(100, batch.num_rows());

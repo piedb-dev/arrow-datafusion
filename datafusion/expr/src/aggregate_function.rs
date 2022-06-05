@@ -86,6 +86,8 @@ pub enum AggregateFunction {
     ApproxPercentileContWithWeight,
     /// ApproxMedian
     ApproxMedian,
+    /// Grouping
+    Grouping,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -121,6 +123,7 @@ impl FromStr for AggregateFunction {
                 AggregateFunction::ApproxPercentileContWithWeight
             }
             "approx_median" => AggregateFunction::ApproxMedian,
+            "grouping" => AggregateFunction::Grouping,
             _ => {
                 return Err(DataFusionError::Plan(format!(
                     "There is no built-in function named {}",
@@ -143,9 +146,8 @@ pub fn return_type(
     let coerced_data_types = coerce_types(fun, input_expr_types, &signature(fun))?;
 
     match fun {
-        // TODO If the datafusion is compatible with PostgreSQL, the returned data type should be INT64.
         AggregateFunction::Count | AggregateFunction::ApproxDistinct => {
-            Ok(DataType::UInt64)
+            Ok(DataType::Int64)
         }
         AggregateFunction::Max | AggregateFunction::Min => {
             // For min and max agg function, the returned type is same as input type.
@@ -173,6 +175,7 @@ pub fn return_type(
             Ok(coerced_data_types[0].clone())
         }
         AggregateFunction::ApproxMedian => Ok(coerced_data_types[0].clone()),
+        AggregateFunction::Grouping => Ok(DataType::Int32),
     }
 }
 
@@ -326,6 +329,7 @@ pub fn coerce_types(
             }
             Ok(input_types.to_vec())
         }
+        AggregateFunction::Grouping => Ok(vec![input_types[0].clone()]),
     }
 }
 
@@ -335,6 +339,7 @@ pub fn signature(fun: &AggregateFunction) -> Signature {
     match fun {
         AggregateFunction::Count
         | AggregateFunction::ApproxDistinct
+        | AggregateFunction::Grouping
         | AggregateFunction::ArrayAgg => Signature::any(1, Volatility::Immutable),
         AggregateFunction::Min | AggregateFunction::Max => {
             let valid = STRINGS
@@ -682,7 +687,7 @@ pub fn is_correlation_support_arg_type(arg_type: &DataType) -> bool {
 }
 
 /// Return `true` if `arg_type` is of a [`DataType`] that the
-/// [`ApproxPercentileCont`] aggregation can operate on.
+/// [`AggregateFunction::ApproxPercentileCont`] aggregation can operate on.
 pub fn is_approx_percentile_cont_supported_arg_type(arg_type: &DataType) -> bool {
     matches!(
         arg_type,

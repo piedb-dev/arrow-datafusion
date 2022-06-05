@@ -29,7 +29,6 @@ use arrow::datatypes::SchemaRef;
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
-use async_trait::async_trait;
 pub use datafusion_expr::Accumulator;
 pub use datafusion_expr::ColumnarValue;
 pub use display::DisplayFormatType;
@@ -128,7 +127,6 @@ pub struct ColumnStatistics {
 /// [`ExecutionPlan`] can be displayed in an simplified form using the
 /// return value from [`displayable`] in addition to the (normally
 /// quite verbose) `Debug` output.
-#[async_trait]
 pub trait ExecutionPlan: Debug + Send + Sync {
     /// Returns the execution plan as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
@@ -223,7 +221,7 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// creates an iterator
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -290,6 +288,7 @@ pub fn with_new_children_if_necessary(
 /// ```
 /// use datafusion::prelude::*;
 /// use datafusion::physical_plan::displayable;
+/// use std::path::is_separator;
 ///
 /// #[tokio::main]
 /// async fn main() {
@@ -312,11 +311,15 @@ pub fn with_new_children_if_necessary(
 ///   let displayable_plan = displayable(physical_plan.as_ref());
 ///   let plan_string = format!("{}", displayable_plan.indent());
 ///
+///   let working_directory = std::env::current_dir().unwrap();
+///   let normalized = working_directory.to_string_lossy().replace(is_separator, "/");
+///   let plan_string = plan_string.replace(&normalized, "WORKING_DIR");
+///
 ///   assert_eq!("ProjectionExec: expr=[a@0 as a]\
 ///              \n  CoalesceBatchesExec: target_batch_size=4096\
 ///              \n    FilterExec: a@0 < 5\
 ///              \n      RepartitionExec: partitioning=RoundRobinBatch(3)\
-///              \n        CsvExec: files=[tests/example.csv], has_header=true, limit=None, projection=[a]",
+///              \n        CsvExec: files=[WORKING_DIR/tests/example.csv], has_header=true, limit=None, projection=[a]",
 ///               plan_string.trim());
 ///
 ///   let one_line = format!("{}", displayable_plan.one_line());
@@ -426,13 +429,13 @@ pub async fn execute_stream(
 ) -> Result<SendableRecordBatchStream> {
     match plan.output_partitioning().partition_count() {
         0 => Ok(Box::pin(EmptyRecordBatchStream::new(plan.schema()))),
-        1 => plan.execute(0, context).await,
+        1 => plan.execute(0, context),
         _ => {
             // merge into a single partition
             let plan = CoalescePartitionsExec::new(plan.clone());
             // CoalescePartitionsExec must produce a single partition
             assert_eq!(1, plan.output_partitioning().partition_count());
-            plan.execute(0, context).await
+            plan.execute(0, context)
         }
     }
 }
@@ -458,7 +461,7 @@ pub async fn execute_stream_partitioned(
     let num_partitions = plan.output_partitioning().partition_count();
     let mut streams = Vec::with_capacity(num_partitions);
     for i in 0..num_partitions {
-        streams.push(plan.execute(i, context.clone()).await?);
+        streams.push(plan.execute(i, context.clone())?);
     }
     Ok(streams)
 }
@@ -549,14 +552,8 @@ pub mod cross_join;
 pub mod display;
 pub mod empty;
 pub mod explain;
-use crate::execution::context::TaskContext;
-pub use datafusion_physical_expr::expressions;
-
-pub mod aggregate_rule;
 pub mod file_format;
 pub mod filter;
-pub mod functions;
-pub mod hash_aggregate;
 pub mod hash_join;
 pub mod hash_utils;
 pub mod join_utils;
@@ -566,11 +563,13 @@ pub mod metrics;
 pub mod planner;
 pub mod projection;
 pub mod repartition;
+pub mod sort_merge_join;
 pub mod sorts;
 pub mod stream;
-pub mod type_coercion;
 pub mod udaf;
-pub mod udf;
 pub mod union;
 pub mod values;
 pub mod windows;
+
+use crate::execution::context::TaskContext;
+pub use datafusion_physical_expr::{expressions, functions, type_coercion, udf};

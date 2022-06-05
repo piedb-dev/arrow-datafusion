@@ -43,7 +43,6 @@ use super::{
 };
 
 use crate::execution::context::TaskContext;
-use async_trait::async_trait;
 
 /// Limit execution plan
 #[derive(Debug)]
@@ -77,7 +76,6 @@ impl GlobalLimitExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for GlobalLimitExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -127,7 +125,7 @@ impl ExecutionPlan for GlobalLimitExec {
         )))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -152,7 +150,7 @@ impl ExecutionPlan for GlobalLimitExec {
         }
 
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let stream = self.input.execute(0, context).await?;
+        let stream = self.input.execute(0, context)?;
         Ok(Box::pin(LimitStream::new(
             stream,
             self.limit,
@@ -230,7 +228,6 @@ impl LocalLimitExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for LocalLimitExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -282,14 +279,14 @@ impl ExecutionPlan for LocalLimitExec {
         }
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         debug!("Start LocalLimitExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let stream = self.input.execute(partition, context).await?;
+        let stream = self.input.execute(partition, context)?;
         Ok(Box::pin(LimitStream::new(
             stream,
             self.limit,
@@ -429,45 +426,26 @@ mod tests {
     use common::collect;
 
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::common;
-    use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
     use crate::prelude::SessionContext;
-    use crate::{test, test_util};
+    use crate::test;
 
     #[tokio::test]
     async fn limit() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
 
         let num_partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", num_partitions)?;
-
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: schema,
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let csv = test::scan_partitioned_csv(num_partitions)?;
 
         // input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let limit =
-            GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(Arc::new(csv))), 7);
+        let limit = GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(csv)), 7);
 
         // the result should contain 4 batches (one per input partition)
-        let iter = limit.execute(0, task_ctx).await?;
+        let iter = limit.execute(0, task_ctx)?;
         let batches = common::collect(iter).await?;
 
         // there should be a total of 100 rows

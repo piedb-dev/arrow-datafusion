@@ -30,17 +30,19 @@ use crate::{
             parquet::{ParquetFormat, DEFAULT_PARQUET_EXTENSION},
             FileFormat,
         },
-        MemTable,
+        MemTable, ViewTable,
     },
     logical_plan::{PlanType, ToStringifiedPlan},
-    optimizer::eliminate_filter::EliminateFilter,
-    optimizer::eliminate_limit::EliminateLimit,
+    optimizer::{
+        eliminate_filter::EliminateFilter, eliminate_limit::EliminateLimit,
+        optimizer::Optimizer,
+    },
     physical_optimizer::{
         aggregate_statistics::AggregateStatistics,
         hash_build_probe_order::HashBuildProbeOrder, optimizer::PhysicalOptimizerRule,
     },
 };
-use log::{debug, trace};
+pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use parking_lot::RwLock;
 use std::string::String;
 use std::sync::Arc;
@@ -54,25 +56,25 @@ use arrow::datatypes::{DataType, SchemaRef};
 use crate::catalog::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     schema::{MemorySchemaProvider, SchemaProvider},
-    ResolvedTableReference, TableReference,
 };
 use crate::dataframe::DataFrame;
-use crate::datasource::listing::ListingTableConfig;
+use crate::datasource::listing::{ListingTableConfig, ListingTableUrl};
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::{
-    CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateMemoryTable,
-    DropTable, FileType, FunctionRegistry, LogicalPlan, LogicalPlanBuilder,
-    UNNAMED_TABLE,
+    provider_as_source, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
+    CreateMemoryTable, CreateView, DropTable, FileType, FunctionRegistry, LogicalPlan,
+    LogicalPlanBuilder, UNNAMED_TABLE,
 };
 use crate::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
-use crate::optimizer::optimizer::OptimizerRule;
+use crate::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
 use crate::optimizer::projection_push_down::ProjectionPushDown;
 use crate::optimizer::simplify_expressions::SimplifyExpressions;
 use crate::optimizer::single_distinct_to_groupby::SingleDistinctToGroupBy;
-use crate::optimizer::to_approx_perc::ToApproxPerc;
+use crate::optimizer::subquery_filter_to_join::SubqueryFilterToJoin;
+use datafusion_sql::{ResolvedTableReference, TableReference};
 
 use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
 use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
@@ -86,13 +88,14 @@ use crate::physical_plan::udaf::AggregateUDF;
 use crate::physical_plan::udf::ScalarUDF;
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::PhysicalPlanner;
-use crate::sql::{
-    parser::DFParser,
-    planner::{ContextProvider, SqlToRel},
-};
 use crate::variable::{VarProvider, VarType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use datafusion_expr::TableSource;
+use datafusion_sql::{
+    parser::DFParser,
+    planner::{ContextProvider, SqlToRel},
+};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -288,15 +291,17 @@ impl SessionContext {
                 name,
                 input,
                 if_not_exists,
+                or_replace,
             }) => {
                 let table = self.table(name.as_str());
 
-                match (if_not_exists, table) {
-                    (true, Ok(_)) => {
+                match (if_not_exists, or_replace, table) {
+                    (true, false, Ok(_)) => {
                         let plan = LogicalPlanBuilder::empty(false).build()?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
                     }
-                    (_, Err(_)) => {
+                    (false, true, Ok(_)) => {
+                        self.deregister_table(name.as_str())?;
                         let plan = self.optimize(&input)?;
                         let physical =
                             Arc::new(DataFrame::new(self.state.clone(), &plan));
@@ -306,6 +311,53 @@ impl SessionContext {
                             Arc::new(plan.schema().as_ref().into()),
                             batches,
                         )?);
+
+                        self.register_table(name.as_str(), table)?;
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                    }
+                    (true, true, Ok(_)) => Err(DataFusionError::Internal(
+                        "'IF NOT EXISTS' cannot coexist with 'REPLACE'".to_string(),
+                    )),
+                    (_, _, Err(_)) => {
+                        let plan = self.optimize(&input)?;
+                        let physical =
+                            Arc::new(DataFrame::new(self.state.clone(), &plan));
+
+                        let batches: Vec<_> = physical.collect_partitioned().await?;
+                        let table = Arc::new(MemTable::try_new(
+                            Arc::new(plan.schema().as_ref().into()),
+                            batches,
+                        )?);
+
+                        self.register_table(name.as_str(), table)?;
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                    }
+                    (false, false, Ok(_)) => Err(DataFusionError::Execution(format!(
+                        "Table '{:?}' already exists",
+                        name
+                    ))),
+                }
+            }
+
+            LogicalPlan::CreateView(CreateView {
+                name,
+                input,
+                or_replace,
+            }) => {
+                let view = self.table(name.as_str());
+
+                match (or_replace, view) {
+                    (true, Ok(_)) => {
+                        self.deregister_table(name.as_str())?;
+                        let plan = self.optimize(&input)?;
+                        let table = Arc::new(ViewTable::try_new(plan.clone())?);
+
+                        self.register_table(name.as_str(), table)?;
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                    }
+                    (_, Err(_)) => {
+                        let plan = self.optimize(&input)?;
+                        let table = Arc::new(ViewTable::try_new(plan.clone())?);
 
                         self.register_table(name.as_str(), table)?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
@@ -401,10 +453,7 @@ impl SessionContext {
                 }
             }
 
-            plan => Ok(Arc::new(DataFrame::new(
-                self.state.clone(),
-                &self.optimize(&plan)?,
-            ))),
+            plan => Ok(Arc::new(DataFrame::new(self.state.clone(), &plan))),
         }
     }
 
@@ -469,47 +518,55 @@ impl SessionContext {
     /// Creates a DataFrame for reading an Avro data source.
     pub async fn read_avro(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: AvroReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
-        Ok(Arc::new(DataFrame::new(
-            self.state.clone(),
-            &LogicalPlanBuilder::scan_avro(
-                object_store,
-                path,
-                options,
-                None,
-                target_partitions,
-            )
-            .await?
-            .build()?,
-        )))
+
+        let listing_options = options.to_listing_options(target_partitions);
+
+        let resolved_schema = match options.schema {
+            Some(s) => s,
+            None => {
+                listing_options
+                    .infer_schema(&self.state(), &table_path)
+                    .await?
+            }
+        };
+
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+        let provider = ListingTable::try_new(config)?;
+        self.read_table(Arc::new(provider))
     }
 
     /// Creates a DataFrame for reading an Json data source.
     pub async fn read_json(
         &mut self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: NdJsonReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
-        Ok(Arc::new(DataFrame::new(
-            self.state.clone(),
-            &LogicalPlanBuilder::scan_json(
-                object_store,
-                path,
-                options,
-                None,
-                target_partitions,
-            )
-            .await?
-            .build()?,
-        )))
+
+        let listing_options = options.to_listing_options(target_partitions);
+
+        let resolved_schema = match options.schema {
+            Some(s) => s,
+            None => {
+                listing_options
+                    .infer_schema(&self.state(), &table_path)
+                    .await?
+            }
+        };
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+        let provider = ListingTable::try_new(config)?;
+
+        self.read_table(Arc::new(provider))
     }
 
     /// Creates an empty DataFrame.
@@ -523,75 +580,77 @@ impl SessionContext {
     /// Creates a DataFrame for reading a CSV data source.
     pub async fn read_csv(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: CsvReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
-        Ok(Arc::new(DataFrame::new(
-            self.state.clone(),
-            &LogicalPlanBuilder::scan_csv(
-                object_store,
-                path,
-                options,
-                None,
-                target_partitions,
-            )
-            .await?
-            .build()?,
-        )))
+        let listing_options = options.to_listing_options(target_partitions);
+        let resolved_schema = match options.schema {
+            Some(s) => Arc::new(s.to_owned()),
+            None => {
+                listing_options
+                    .infer_schema(&self.state(), &table_path)
+                    .await?
+            }
+        };
+        let config = ListingTableConfig::new(table_path.clone())
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+
+        let provider = ListingTable::try_new(config)?;
+        self.read_table(Arc::new(provider))
     }
 
     /// Creates a DataFrame for reading a Parquet data source.
     pub async fn read_parquet(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: ParquetReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
-        let logical_plan = LogicalPlanBuilder::scan_parquet(
-            object_store,
-            path,
-            options,
-            None,
-            target_partitions,
-        )
-        .await?
-        .build()?;
-        Ok(Arc::new(DataFrame::new(self.state.clone(), &logical_plan)))
+
+        let listing_options = options.to_listing_options(target_partitions);
+
+        // with parquet we resolve the schema in all cases
+        let resolved_schema = listing_options
+            .infer_schema(&self.state(), &table_path)
+            .await?;
+
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+
+        let provider = ListingTable::try_new(config)?;
+        self.read_table(Arc::new(provider))
     }
 
     /// Creates a DataFrame for reading a custom TableProvider.
     pub fn read_table(&self, provider: Arc<dyn TableProvider>) -> Result<Arc<DataFrame>> {
         Ok(Arc::new(DataFrame::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan(UNNAMED_TABLE, provider, None)?.build()?,
+            &LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(provider), None)?
+                .build()?,
         )))
     }
 
     /// Registers a table that uses the listing feature of the object store to
     /// find the files to be processed
     /// This is async because it might need to resolve the schema.
-    pub async fn register_listing_table<'a>(
-        &'a self,
-        name: &'a str,
-        uri: &'a str,
+    pub async fn register_listing_table(
+        &self,
+        name: &str,
+        table_path: impl AsRef<str>,
         options: ListingOptions,
         provided_schema: Option<SchemaRef>,
     ) -> Result<()> {
-        let (object_store, path) = self.runtime_env().object_store(uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let resolved_schema = match provided_schema {
-            None => {
-                options
-                    .infer_schema(Arc::clone(&object_store), path)
-                    .await?
-            }
+            None => options.infer_schema(&self.state(), &table_path).await?,
             Some(s) => s,
         };
-        let config = ListingTableConfig::new(object_store, path)
+        let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
         let table = ListingTable::try_new(config)?;
@@ -604,7 +663,7 @@ impl SessionContext {
     pub async fn register_csv(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: CsvReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
@@ -612,7 +671,7 @@ impl SessionContext {
 
         self.register_listing_table(
             name,
-            uri,
+            table_path,
             listing_options,
             options.schema.map(|s| Arc::new(s.to_owned())),
         )
@@ -626,13 +685,13 @@ impl SessionContext {
     pub async fn register_json(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: NdJsonReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
             options.to_listing_options(self.copied_config().target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, options.schema)
+        self.register_listing_table(name, table_path, listing_options, options.schema)
             .await?;
         Ok(())
     }
@@ -642,7 +701,7 @@ impl SessionContext {
     pub async fn register_parquet(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: ParquetReadOptions<'_>,
     ) -> Result<()> {
         let (target_partitions, parquet_pruning) = {
@@ -653,7 +712,7 @@ impl SessionContext {
             .parquet_pruning(parquet_pruning)
             .to_listing_options(target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, None)
+        self.register_listing_table(name, table_path, listing_options, None)
             .await?;
         Ok(())
     }
@@ -663,13 +722,13 @@ impl SessionContext {
     pub async fn register_avro(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: AvroReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
             options.to_listing_options(self.copied_config().target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, options.schema)
+        self.register_listing_table(name, table_path, listing_options, options.schema)
             .await?;
         Ok(())
     }
@@ -765,7 +824,7 @@ impl SessionContext {
             Some(ref provider) => {
                 let plan = LogicalPlanBuilder::scan(
                     table_ref.table(),
-                    Arc::clone(provider),
+                    provider_as_source(Arc::clone(provider)),
                     None,
                 )?
                 .build()?;
@@ -861,6 +920,11 @@ impl SessionContext {
     /// Get a new TaskContext to run in this session
     pub fn task_ctx(&self) -> Arc<TaskContext> {
         Arc::new(TaskContext::from(self))
+    }
+
+    /// Get a copy of the [`SessionState`] of this [`SessionContext`]
+    pub fn state(&self) -> SessionState {
+        self.state.read().clone()
     }
 }
 
@@ -1065,75 +1129,13 @@ impl SessionConfig {
     }
 }
 
-/// Holds per-execution properties and data (such as starting timestamps, etc).
-/// An instance of this struct is created each time a [`LogicalPlan`] is prepared for
-/// execution (optimized). If the same plan is optimized multiple times, a new
-/// `ExecutionProps` is created each time.
-///
-/// It is important that this structure be cheap to create as it is
-/// done so during predicate pruning and expression simplification
-#[derive(Clone)]
-pub struct ExecutionProps {
-    pub(crate) query_execution_start_time: DateTime<Utc>,
-    /// providers for scalar variables
-    pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
-}
-
-impl Default for ExecutionProps {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ExecutionProps {
-    /// Creates a new execution props
-    pub fn new() -> Self {
-        ExecutionProps {
-            query_execution_start_time: chrono::Utc::now(),
-            var_providers: None,
-        }
-    }
-
-    /// Marks the execution of query started timestamp
-    pub fn start_execution(&mut self) -> &Self {
-        self.query_execution_start_time = chrono::Utc::now();
-        &*self
-    }
-
-    /// Registers a variable provider, returning the existing
-    /// provider, if any
-    pub fn add_var_provider(
-        &mut self,
-        var_type: VarType,
-        provider: Arc<dyn VarProvider + Send + Sync>,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        let mut var_providers = self.var_providers.take().unwrap_or_default();
-
-        let old_provider = var_providers.insert(var_type, provider);
-
-        self.var_providers = Some(var_providers);
-
-        old_provider
-    }
-
-    /// Returns the provider for the var_type, if any
-    pub fn get_var_provider(
-        &self,
-        var_type: VarType,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        self.var_providers
-            .as_ref()
-            .and_then(|var_providers| var_providers.get(&var_type).map(Arc::clone))
-    }
-}
-
 /// Execution context for registering data sources and executing queries
 #[derive(Clone)]
 pub struct SessionState {
     /// Uuid for the session
     pub session_id: String,
     /// Responsible for optimizing a logical plan
-    pub optimizers: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+    pub optimizer: Optimizer,
     /// Responsible for optimizing a physical execution plan
     pub physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
     /// Responsible for planning `LogicalPlan`s, and `ExecutionPlan`
@@ -1199,10 +1201,11 @@ impl SessionState {
 
         SessionState {
             session_id,
-            optimizers: vec![
+            optimizer: Optimizer::new(vec![
                 // Simplify expressions first to maximize the chance
                 // of applying other optimizations
                 Arc::new(SimplifyExpressions::new()),
+                Arc::new(SubqueryFilterToJoin::new()),
                 Arc::new(EliminateFilter::new()),
                 Arc::new(CommonSubexprEliminate::new()),
                 Arc::new(EliminateLimit::new()),
@@ -1210,11 +1213,7 @@ impl SessionState {
                 Arc::new(FilterPushDown::new()),
                 Arc::new(LimitPushDown::new()),
                 Arc::new(SingleDistinctToGroupBy::new()),
-                // ToApproxPerc must be applied last because
-                // it rewrites only the function and may interfere with
-                // other rules
-                Arc::new(ToApproxPerc::new()),
-            ],
+            ]),
             physical_optimizers: vec![
                 Arc::new(AggregateStatistics::new()),
                 Arc::new(HashBuildProbeOrder::new()),
@@ -1246,7 +1245,6 @@ impl SessionState {
         table_ref: impl Into<TableReference<'a>>,
     ) -> Result<Arc<dyn SchemaProvider>> {
         let resolved_ref = self.resolve_table_ref(table_ref);
-
         self.catalog_list
             .catalog(resolved_ref.catalog)
             .ok_or_else(|| {
@@ -1276,9 +1274,9 @@ impl SessionState {
     /// Replace the optimizer rules
     pub fn with_optimizer_rules(
         mut self,
-        optimizers: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+        rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
     ) -> Self {
-        self.optimizers = optimizers;
+        self.optimizer = Optimizer::new(rules);
         self
     }
 
@@ -1296,7 +1294,7 @@ impl SessionState {
         mut self,
         optimizer_rule: Arc<dyn OptimizerRule + Send + Sync>,
     ) -> Self {
-        self.optimizers.push(optimizer_rule);
+        self.optimizer.rules.push(optimizer_rule);
         self
     }
 
@@ -1311,16 +1309,23 @@ impl SessionState {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
+        let mut optimizer_config = OptimizerConfig::new();
+        optimizer_config.query_execution_start_time =
+            self.execution_props.query_execution_start_time;
+
         if let LogicalPlan::Explain(e) = plan {
             let mut stringified_plans = e.stringified_plans.clone();
 
             // optimize the child plan, capturing the output of each optimizer
-            let plan =
-                self.optimize_internal(e.plan.as_ref(), |optimized_plan, optimizer| {
+            let plan = self.optimizer.optimize(
+                e.plan.as_ref(),
+                &optimizer_config,
+                |optimized_plan, optimizer| {
                     let optimizer_name = optimizer.name().to_string();
                     let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
                     stringified_plans.push(optimized_plan.to_stringified(plan_type));
-                })?;
+                },
+            )?;
 
             Ok(LogicalPlan::Explain(Explain {
                 verbose: e.verbose,
@@ -1329,35 +1334,8 @@ impl SessionState {
                 schema: e.schema.clone(),
             }))
         } else {
-            self.optimize_internal(plan, |_, _| {})
+            self.optimizer.optimize(plan, &optimizer_config, |_, _| {})
         }
-    }
-
-    /// Optimizes the logical plan by applying optimizer rules, and
-    /// invoking observer function after each call
-    fn optimize_internal<F>(
-        &self,
-        plan: &LogicalPlan,
-        mut observer: F,
-    ) -> Result<LogicalPlan>
-    where
-        F: FnMut(&LogicalPlan, &dyn OptimizerRule),
-    {
-        let execution_props = &mut self.execution_props.clone();
-        let optimizers = &self.optimizers;
-
-        let execution_props = execution_props.start_execution();
-
-        let mut new_plan = plan.clone();
-        debug!("Input logical plan:\n{}\n", plan.display_indent());
-        trace!("Full input logical plan:\n{:?}", plan);
-        for optimizer in optimizers {
-            new_plan = optimizer.optimize(&new_plan, execution_props)?;
-            observer(&new_plan, optimizer.as_ref());
-        }
-        debug!("Optimized logical plan:\n{}\n", new_plan.display_indent());
-        trace!("Full Optimized logical plan:\n {:?}", plan);
-        Ok(new_plan)
     }
 
     /// Creates a physical plan from a logical plan.
@@ -1366,15 +1344,26 @@ impl SessionState {
         logical_plan: &LogicalPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = self.query_planner.clone();
-        planner.create_physical_plan(logical_plan, self).await
+        let logical_plan = self.optimize(logical_plan)?;
+        planner.create_physical_plan(&logical_plan, self).await
     }
 }
 
 impl ContextProvider for SessionState {
-    fn get_table_provider(&self, name: TableReference) -> Option<Arc<dyn TableProvider>> {
+    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
         let resolved_ref = self.resolve_table_ref(name);
-        let schema = self.schema_for_ref(resolved_ref).ok()?;
-        schema.table(resolved_ref.table)
+        match self.schema_for_ref(resolved_ref) {
+            Ok(schema) => {
+                let provider = schema.table(resolved_ref.table).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "'{}.{}.{}' not found",
+                        resolved_ref.catalog, resolved_ref.schema, resolved_ref.table
+                    ))
+                })?;
+                Ok(provider_as_source(provider))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
@@ -1602,28 +1591,20 @@ impl FunctionRegistry for TaskContext {
 mod tests {
     use super::*;
     use crate::execution::context::QueryPlanner;
-    use crate::from_slice::FromSlice;
-    use crate::logical_plan::{binary_expr, lit, Operator};
-    use crate::physical_plan::functions::make_scalar_function;
     use crate::test;
+    use crate::test_util::parquet_test_data;
     use crate::variable::VarType;
     use crate::{
-        assert_batches_eq, assert_batches_sorted_eq,
-        logical_plan::{col, create_udf, sum, Expr},
+        assert_batches_eq,
+        logical_plan::{create_udf, Expr},
     };
-    use crate::{
-        datasource::MemTable, logical_plan::create_udaf,
-        physical_plan::expressions::AvgAccumulator,
-    };
-    use arrow::array::{
-        Array, ArrayRef, DictionaryArray, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeStringArray, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
-    };
+    use crate::{logical_plan::create_udaf, physical_plan::expressions::AvgAccumulator};
+    use arrow::array::ArrayRef;
     use arrow::datatypes::*;
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use datafusion_expr::Volatility;
+    use datafusion_physical_expr::functions::make_scalar_function;
     use std::fs::File;
     use std::sync::Weak;
     use std::thread::{self, JoinHandle};
@@ -1708,1193 +1689,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn left_join_using() -> Result<()> {
-        let results = execute(
-            "SELECT t1.c1, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
-            1,
-        )
-        .await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----+----+",
-            "| c1 | c2 |",
-            "+----+----+",
-            "| 0  | 1  |",
-            "| 0  | 2  |",
-            "| 0  | 3  |",
-            "| 0  | 4  |",
-            "| 0  | 5  |",
-            "| 0  | 6  |",
-            "| 0  | 7  |",
-            "| 0  | 8  |",
-            "| 0  | 9  |",
-            "| 0  | 10 |",
-            "+----+----+",
-        ];
-
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn left_join_using_join_key_projection() -> Result<()> {
-        let results = execute(
-            "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
-            1,
-        )
-            .await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----+----+----+",
-            "| c1 | c2 | c2 |",
-            "+----+----+----+",
-            "| 0  | 1  | 1  |",
-            "| 0  | 2  | 2  |",
-            "| 0  | 3  | 3  |",
-            "| 0  | 4  | 4  |",
-            "| 0  | 5  | 5  |",
-            "| 0  | 6  | 6  |",
-            "| 0  | 7  | 7  |",
-            "| 0  | 8  | 8  |",
-            "| 0  | 9  | 9  |",
-            "| 0  | 10 | 10 |",
-            "+----+----+----+",
-        ];
-
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn left_join() -> Result<()> {
-        let results = execute(
-            "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 ON t1.c2 = t2.c2 ORDER BY t1.c2",
-            1,
-        )
-            .await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----+----+----+",
-            "| c1 | c2 | c2 |",
-            "+----+----+----+",
-            "| 0  | 1  | 1  |",
-            "| 0  | 2  | 2  |",
-            "| 0  | 3  | 3  |",
-            "| 0  | 4  | 4  |",
-            "| 0  | 5  | 5  |",
-            "| 0  | 6  | 6  |",
-            "| 0  | 7  | 7  |",
-            "| 0  | 8  | 8  |",
-            "| 0  | 9  | 9  |",
-            "| 0  | 10 | 10 |",
-            "+----+----+----+",
-        ];
-
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn window() -> Result<()> {
-        let results = execute(
-            "SELECT \
-            c1, \
-            c2, \
-            SUM(c2) OVER (), \
-            COUNT(c2) OVER (), \
-            MAX(c2) OVER (), \
-            MIN(c2) OVER (), \
-            AVG(c2) OVER () \
-            FROM test \
-            ORDER BY c1, c2 \
-            LIMIT 5",
-            4,
-        )
-        .await?;
-        // result in one batch, although e.g. having 2 batches do not change
-        // result semantics, having a len=1 assertion upfront keeps surprises
-        // at bay
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-            "| 0  | 1  | 220          | 40             | 10           | 1            | 5.5          |",
-            "| 0  | 2  | 220          | 40             | 10           | 1            | 5.5          |",
-            "| 0  | 3  | 220          | 40             | 10           | 1            | 5.5          |",
-            "| 0  | 4  | 220          | 40             | 10           | 1            | 5.5          |",
-            "| 0  | 5  | 220          | 40             | 10           | 1            | 5.5          |",
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-        ];
-
-        // window function shall respect ordering
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn window_order_by() -> Result<()> {
-        let results = execute(
-            "SELECT \
-            c1, \
-            c2, \
-            ROW_NUMBER() OVER (ORDER BY c1, c2), \
-            FIRST_VALUE(c2) OVER (ORDER BY c1, c2), \
-            LAST_VALUE(c2) OVER (ORDER BY c1, c2), \
-            NTH_VALUE(c2, 2) OVER (ORDER BY c1, c2), \
-            SUM(c2) OVER (ORDER BY c1, c2), \
-            COUNT(c2) OVER (ORDER BY c1, c2), \
-            MAX(c2) OVER (ORDER BY c1, c2), \
-            MIN(c2) OVER (ORDER BY c1, c2), \
-            AVG(c2) OVER (ORDER BY c1, c2) \
-            FROM test \
-            ORDER BY c1, c2 \
-            LIMIT 5",
-            4,
-        )
-        .await?;
-        // result in one batch, although e.g. having 2 batches do not change
-        // result semantics, having a len=1 assertion upfront keeps surprises
-        // at bay
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2) | LAST_VALUE(test.c2) | NTH_VALUE(test.c2,Int64(2)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
-            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| 0  | 1  | 1            | 1                    | 1                   |                             | 1            | 1              | 1            | 1            | 1            |",
-            "| 0  | 2  | 2            | 1                    | 2                   | 2                           | 3            | 2              | 2            | 1            | 1.5          |",
-            "| 0  | 3  | 3            | 1                    | 3                   | 2                           | 6            | 3              | 3            | 1            | 2            |",
-            "| 0  | 4  | 4            | 1                    | 4                   | 2                           | 10           | 4              | 4            | 1            | 2.5          |",
-            "| 0  | 5  | 5            | 1                    | 5                   | 2                           | 15           | 5              | 5            | 1            | 3            |",
-            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
-        ];
-
-        // window function shall respect ordering
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn window_partition_by() -> Result<()> {
-        let results = execute(
-            "SELECT \
-            c1, \
-            c2, \
-            SUM(c2) OVER (PARTITION BY c2), \
-            COUNT(c2) OVER (PARTITION BY c2), \
-            MAX(c2) OVER (PARTITION BY c2), \
-            MIN(c2) OVER (PARTITION BY c2), \
-            AVG(c2) OVER (PARTITION BY c2) \
-            FROM test \
-            ORDER BY c1, c2 \
-            LIMIT 5",
-            4,
-        )
-        .await?;
-
-        let expected = vec![
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-            "| 0  | 1  | 4            | 4              | 1            | 1            | 1            |",
-            "| 0  | 2  | 8            | 4              | 2            | 2            | 2            |",
-            "| 0  | 3  | 12           | 4              | 3            | 3            | 3            |",
-            "| 0  | 4  | 16           | 4              | 4            | 4            | 4            |",
-            "| 0  | 5  | 20           | 4              | 5            | 5            | 5            |",
-            "+----+----+--------------+----------------+--------------+--------------+--------------+",
-        ];
-
-        // window function shall respect ordering
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn window_partition_by_order_by() -> Result<()> {
-        let results = execute(
-            "SELECT \
-            c1, \
-            c2, \
-            ROW_NUMBER() OVER (PARTITION BY c2 ORDER BY c1), \
-            FIRST_VALUE(c2 + c1) OVER (PARTITION BY c2 ORDER BY c1), \
-            LAST_VALUE(c2 + c1) OVER (PARTITION BY c2 ORDER BY c1), \
-            NTH_VALUE(c2 + c1, 1) OVER (PARTITION BY c2 ORDER BY c1), \
-            SUM(c2) OVER (PARTITION BY c2 ORDER BY c1), \
-            COUNT(c2) OVER (PARTITION BY c2 ORDER BY c1), \
-            MAX(c2) OVER (PARTITION BY c2 ORDER BY c1), \
-            MIN(c2) OVER (PARTITION BY c2 ORDER BY c1), \
-            AVG(c2) OVER (PARTITION BY c2 ORDER BY c1) \
-            FROM test \
-            ORDER BY c1, c2 \
-            LIMIT 5",
-            4,
-        )
-        .await?;
-
-        let expected = vec![
-            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2 + test.c1) | LAST_VALUE(test.c2 + test.c1) | NTH_VALUE(test.c2 + test.c1,Int64(1)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
-            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| 0  | 1  | 1            | 1                              | 1                             | 1                                     | 1            | 1              | 1            | 1            | 1            |",
-            "| 0  | 2  | 1            | 2                              | 2                             | 2                                     | 2            | 1              | 2            | 2            | 2            |",
-            "| 0  | 3  | 1            | 3                              | 3                             | 3                                     | 3            | 1              | 3            | 3            | 3            |",
-            "| 0  | 4  | 1            | 4                              | 4                             | 4                                     | 4            | 1              | 4            | 4            | 4            |",
-            "| 0  | 5  | 1            | 5                              | 5                             | 5                                     | 5            | 1              | 5            | 5            | 5            |",
-            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
-        ];
-
-        // window function shall respect ordering
-        assert_batches_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_decimal_min() -> Result<()> {
-        let ctx = SessionContext::new();
-        // the data type of c1 is decimal(10,3)
-        ctx.register_table("d_table", test::table_with_decimal())
-            .unwrap();
-        let result = plan_and_collect(&ctx, "select min(c1) from d_table")
-            .await
-            .unwrap();
-        let expected = vec![
-            "+-----------------+",
-            "| MIN(d_table.c1) |",
-            "+-----------------+",
-            "| -100.009        |",
-            "+-----------------+",
-        ];
-        assert_eq!(
-            &DataType::Decimal(10, 3),
-            result[0].schema().field(0).data_type()
-        );
-        assert_batches_sorted_eq!(expected, &result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_decimal_max() -> Result<()> {
-        let ctx = SessionContext::new();
-        // the data type of c1 is decimal(10,3)
-        ctx.register_table("d_table", test::table_with_decimal())
-            .unwrap();
-
-        let result = plan_and_collect(&ctx, "select max(c1) from d_table")
-            .await
-            .unwrap();
-        let expected = vec![
-            "+-----------------+",
-            "| MAX(d_table.c1) |",
-            "+-----------------+",
-            "| 110.009         |",
-            "+-----------------+",
-        ];
-        assert_eq!(
-            &DataType::Decimal(10, 3),
-            result[0].schema().field(0).data_type()
-        );
-        assert_batches_sorted_eq!(expected, &result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_decimal_sum() -> Result<()> {
-        let ctx = SessionContext::new();
-        // the data type of c1 is decimal(10,3)
-        ctx.register_table("d_table", test::table_with_decimal())
-            .unwrap();
-        let result = plan_and_collect(&ctx, "select sum(c1) from d_table")
-            .await
-            .unwrap();
-        let expected = vec![
-            "+-----------------+",
-            "| SUM(d_table.c1) |",
-            "+-----------------+",
-            "| 100.000         |",
-            "+-----------------+",
-        ];
-        assert_eq!(
-            &DataType::Decimal(20, 3),
-            result[0].schema().field(0).data_type()
-        );
-        assert_batches_sorted_eq!(expected, &result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_decimal_avg() -> Result<()> {
-        let ctx = SessionContext::new();
-        // the data type of c1 is decimal(10,3)
-        ctx.register_table("d_table", test::table_with_decimal())
-            .unwrap();
-        let result = plan_and_collect(&ctx, "select avg(c1) from d_table")
-            .await
-            .unwrap();
-        let expected = vec![
-            "+-----------------+",
-            "| AVG(d_table.c1) |",
-            "+-----------------+",
-            "| 5.0000000       |",
-            "+-----------------+",
-        ];
-        assert_eq!(
-            &DataType::Decimal(14, 7),
-            result[0].schema().field(0).data_type()
-        );
-        assert_batches_sorted_eq!(expected, &result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate() -> Result<()> {
-        let results = execute("SELECT SUM(c1), SUM(c2) FROM test", 4).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+--------------+",
-            "| SUM(test.c1) | SUM(test.c2) |",
-            "+--------------+--------------+",
-            "| 60           | 220          |",
-            "+--------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_empty() -> Result<()> {
-        // The predicate on this query purposely generates no results
-        let results = execute("SELECT SUM(c1), SUM(c2) FROM test where c1 > 100000", 4)
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+--------------+",
-            "| SUM(test.c1) | SUM(test.c2) |",
-            "+--------------+--------------+",
-            "|              |              |",
-            "+--------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_avg() -> Result<()> {
-        let results = execute("SELECT AVG(c1), AVG(c2) FROM test", 4).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+--------------+",
-            "| AVG(test.c1) | AVG(test.c2) |",
-            "+--------------+--------------+",
-            "| 1.5          | 5.5          |",
-            "+--------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_max() -> Result<()> {
-        let results = execute("SELECT MAX(c1), MAX(c2) FROM test", 4).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+--------------+",
-            "| MAX(test.c1) | MAX(test.c2) |",
-            "+--------------+--------------+",
-            "| 3            | 10           |",
-            "+--------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_min() -> Result<()> {
-        let results = execute("SELECT MIN(c1), MIN(c2) FROM test", 4).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+--------------+",
-            "| MIN(test.c1) | MIN(test.c2) |",
-            "+--------------+--------------+",
-            "| 0            | 1            |",
-            "+--------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_grouped() -> Result<()> {
-        let results = execute("SELECT c1, SUM(c2) FROM test GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+--------------+",
-            "| c1 | SUM(test.c2) |",
-            "+----+--------------+",
-            "| 0  | 55           |",
-            "| 1  | 55           |",
-            "| 2  | 55           |",
-            "| 3  | 55           |",
-            "+----+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_grouped_avg() -> Result<()> {
-        let results = execute("SELECT c1, AVG(c2) FROM test GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+--------------+",
-            "| c1 | AVG(test.c2) |",
-            "+----+--------------+",
-            "| 0  | 5.5          |",
-            "| 1  | 5.5          |",
-            "| 2  | 5.5          |",
-            "| 3  | 5.5          |",
-            "+----+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn boolean_literal() -> Result<()> {
-        let results =
-            execute("SELECT c1, c3 FROM test WHERE c1 > 2 AND c3 = true", 4).await?;
-
-        let expected = vec![
-            "+----+------+",
-            "| c1 | c3   |",
-            "+----+------+",
-            "| 3  | true |",
-            "| 3  | true |",
-            "| 3  | true |",
-            "| 3  | true |",
-            "| 3  | true |",
-            "+----+------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_grouped_empty() -> Result<()> {
-        let results =
-            execute("SELECT c1, AVG(c2) FROM test WHERE c1 = 123 GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+--------------+",
-            "| c1 | AVG(test.c2) |",
-            "+----+--------------+",
-            "+----+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_grouped_max() -> Result<()> {
-        let results = execute("SELECT c1, MAX(c2) FROM test GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+--------------+",
-            "| c1 | MAX(test.c2) |",
-            "+----+--------------+",
-            "| 0  | 10           |",
-            "| 1  | 10           |",
-            "| 2  | 10           |",
-            "| 3  | 10           |",
-            "+----+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_grouped_min() -> Result<()> {
-        let results = execute("SELECT c1, MIN(c2) FROM test GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+--------------+",
-            "| c1 | MIN(test.c2) |",
-            "+----+--------------+",
-            "| 0  | 1            |",
-            "| 1  | 1            |",
-            "| 2  | 1            |",
-            "| 3  | 1            |",
-            "+----+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_avg_add() -> Result<()> {
-        let results = execute(
-            "SELECT AVG(c1), AVG(c1) + 1, AVG(c1) + 2, 1 + AVG(c1) FROM test",
-            4,
-        )
-        .await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+--------------+----------------------------+----------------------------+----------------------------+",
-            "| AVG(test.c1) | AVG(test.c1) Plus Int64(1) | AVG(test.c1) Plus Int64(2) | Int64(1) Plus AVG(test.c1) |",
-            "+--------------+----------------------------+----------------------------+----------------------------+",
-            "| 1.5          | 2.5                        | 3.5                        | 2.5                        |",
-            "+--------------+----------------------------+----------------------------+----------------------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn join_partitioned() -> Result<()> {
-        // self join on partition id (workaround for duplicate column name)
-        let results = execute(
-            "SELECT 1 FROM test JOIN (SELECT c1 AS id1 FROM test) AS a ON c1=id1",
-            4,
-        )
-        .await?;
-
-        assert_eq!(
-            results.iter().map(|b| b.num_rows()).sum::<usize>(),
-            4 * 10 * 10
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn count_basic() -> Result<()> {
-        let results = execute("SELECT COUNT(c1), COUNT(c2) FROM test", 1).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----------------+----------------+",
-            "| COUNT(test.c1) | COUNT(test.c2) |",
-            "+----------------+----------------+",
-            "| 10             | 10             |",
-            "+----------------+----------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn count_partitioned() -> Result<()> {
-        let results = execute("SELECT COUNT(c1), COUNT(c2) FROM test", 4).await?;
-        assert_eq!(results.len(), 1);
-
-        let expected = vec![
-            "+----------------+----------------+",
-            "| COUNT(test.c1) | COUNT(test.c2) |",
-            "+----------------+----------------+",
-            "| 40             | 40             |",
-            "+----------------+----------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn count_aggregated() -> Result<()> {
-        let results = execute("SELECT c1, COUNT(c2) FROM test GROUP BY c1", 4).await?;
-
-        let expected = vec![
-            "+----+----------------+",
-            "| c1 | COUNT(test.c2) |",
-            "+----+----------------+",
-            "| 0  | 10             |",
-            "| 1  | 10             |",
-            "| 2  | 10             |",
-            "| 3  | 10             |",
-            "+----+----------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_by_date_trunc() -> Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("c2", DataType::UInt64, false),
-            Field::new(
-                "t1",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
-
-        // generate a partitioned file
-        for partition in 0..4 {
-            let filename = format!("partition-{}.{}", partition, "csv");
-            let file_path = tmp_dir.path().join(&filename);
-            let mut file = File::create(file_path)?;
-
-            // generate some data
-            for i in 0..10 {
-                let data = format!("{},2020-12-{}T00:00:00.000Z\n", i, i + 10);
-                file.write_all(data.as_bytes())?;
-            }
-        }
-
-        ctx.register_csv(
-            "test",
-            tmp_dir.path().to_str().unwrap(),
-            CsvReadOptions::new().schema(&schema).has_header(false),
-        )
-        .await?;
-
-        let results = plan_and_collect(
-            &ctx,
-            "SELECT date_trunc('week', t1) as week, SUM(c2) FROM test GROUP BY date_trunc('week', t1)",
-        ).await?;
-
-        let expected = vec![
-            "+---------------------+--------------+",
-            "| week                | SUM(test.c2) |",
-            "+---------------------+--------------+",
-            "| 2020-12-07 00:00:00 | 24           |",
-            "| 2020-12-14 00:00:00 | 156          |",
-            "+---------------------+--------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_by_largeutf8() {
-        {
-            let ctx = SessionContext::new();
-
-            // input data looks like:
-            // A, 1
-            // B, 2
-            // A, 2
-            // A, 4
-            // C, 1
-            // A, 1
-
-            let str_array: LargeStringArray = vec!["A", "B", "A", "A", "C", "A"]
-                .into_iter()
-                .map(Some)
-                .collect();
-            let str_array = Arc::new(str_array);
-
-            let val_array: Int64Array = vec![1, 2, 2, 4, 1, 1].into();
-            let val_array = Arc::new(val_array);
-
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("str", str_array.data_type().clone(), false),
-                Field::new("val", val_array.data_type().clone(), false),
-            ]));
-
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![str_array, val_array]).unwrap();
-
-            let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
-            ctx.register_table("t", Arc::new(provider)).unwrap();
-
-            let results =
-                plan_and_collect(&ctx, "SELECT str, count(val) FROM t GROUP BY str")
-                    .await
-                    .expect("ran plan correctly");
-
-            let expected = vec![
-                "+-----+--------------+",
-                "| str | COUNT(t.val) |",
-                "+-----+--------------+",
-                "| A   | 4            |",
-                "| B   | 1            |",
-                "| C   | 1            |",
-                "+-----+--------------+",
-            ];
-            assert_batches_sorted_eq!(expected, &results);
-        }
-    }
-
-    #[tokio::test]
-    async fn unprojected_filter() {
-        let ctx = SessionContext::new();
-        let df = ctx
-            .read_table(test::table_with_sequence(1, 3).unwrap())
-            .unwrap();
-
-        let df = df
-            .select(vec![binary_expr(col("i"), Operator::Plus, col("i"))])
-            .unwrap()
-            .filter(col("i").gt(lit(2)))
-            .unwrap();
-        let results = df.collect().await.unwrap();
-
-        let expected = vec![
-            "+--------------------------+",
-            "| ?table?.i Plus ?table?.i |",
-            "+--------------------------+",
-            "| 6                        |",
-            "+--------------------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-    }
-
-    #[tokio::test]
-    async fn group_by_dictionary() {
-        async fn run_test_case<K: ArrowDictionaryKeyType>() {
-            let ctx = SessionContext::new();
-
-            // input data looks like:
-            // A, 1
-            // B, 2
-            // A, 2
-            // A, 4
-            // C, 1
-            // A, 1
-
-            let dict_array: DictionaryArray<K> =
-                vec!["A", "B", "A", "A", "C", "A"].into_iter().collect();
-            let dict_array = Arc::new(dict_array);
-
-            let val_array: Int64Array = vec![1, 2, 2, 4, 1, 1].into();
-            let val_array = Arc::new(val_array);
-
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("dict", dict_array.data_type().clone(), false),
-                Field::new("val", val_array.data_type().clone(), false),
-            ]));
-
-            let batch = RecordBatch::try_new(schema.clone(), vec![dict_array, val_array])
-                .unwrap();
-
-            let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
-            ctx.register_table("t", Arc::new(provider)).unwrap();
-
-            let results =
-                plan_and_collect(&ctx, "SELECT dict, count(val) FROM t GROUP BY dict")
-                    .await
-                    .expect("ran plan correctly");
-
-            let expected = vec![
-                "+------+--------------+",
-                "| dict | COUNT(t.val) |",
-                "+------+--------------+",
-                "| A    | 4            |",
-                "| B    | 1            |",
-                "| C    | 1            |",
-                "+------+--------------+",
-            ];
-            assert_batches_sorted_eq!(expected, &results);
-
-            // Now, use dict as an aggregate
-            let results =
-                plan_and_collect(&ctx, "SELECT val, count(dict) FROM t GROUP BY val")
-                    .await
-                    .expect("ran plan correctly");
-
-            let expected = vec![
-                "+-----+---------------+",
-                "| val | COUNT(t.dict) |",
-                "+-----+---------------+",
-                "| 1   | 3             |",
-                "| 2   | 2             |",
-                "| 4   | 1             |",
-                "+-----+---------------+",
-            ];
-            assert_batches_sorted_eq!(expected, &results);
-
-            // Now, use dict as an aggregate
-            let results = plan_and_collect(
-                &ctx,
-                "SELECT val, count(distinct dict) FROM t GROUP BY val",
-            )
-            .await
-            .expect("ran plan correctly");
-
-            let expected = vec![
-                "+-----+------------------------+",
-                "| val | COUNT(DISTINCT t.dict) |",
-                "+-----+------------------------+",
-                "| 1   | 2                      |",
-                "| 2   | 2                      |",
-                "| 4   | 1                      |",
-                "+-----+------------------------+",
-            ];
-            assert_batches_sorted_eq!(expected, &results);
-        }
-
-        run_test_case::<Int8Type>().await;
-        run_test_case::<Int16Type>().await;
-        run_test_case::<Int32Type>().await;
-        run_test_case::<Int64Type>().await;
-        run_test_case::<UInt8Type>().await;
-        run_test_case::<UInt16Type>().await;
-        run_test_case::<UInt32Type>().await;
-        run_test_case::<UInt64Type>().await;
-    }
-
-    async fn run_count_distinct_integers_aggregated_scenario(
-        partitions: Vec<Vec<(&str, u64)>>,
-    ) -> Result<Vec<RecordBatch>> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("c_group", DataType::Utf8, false),
-            Field::new("c_int8", DataType::Int8, false),
-            Field::new("c_int16", DataType::Int16, false),
-            Field::new("c_int32", DataType::Int32, false),
-            Field::new("c_int64", DataType::Int64, false),
-            Field::new("c_uint8", DataType::UInt8, false),
-            Field::new("c_uint16", DataType::UInt16, false),
-            Field::new("c_uint32", DataType::UInt32, false),
-            Field::new("c_uint64", DataType::UInt64, false),
-        ]));
-
-        for (i, partition) in partitions.iter().enumerate() {
-            let filename = format!("partition-{}.csv", i);
-            let file_path = tmp_dir.path().join(&filename);
-            let mut file = File::create(file_path)?;
-            for row in partition {
-                let row_str = format!(
-                    "{},{}\n",
-                    row.0,
-                    // Populate values for each of the integer fields in the
-                    // schema.
-                    (0..8)
-                        .map(|_| { row.1.to_string() })
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-                file.write_all(row_str.as_bytes())?;
-            }
-        }
-        ctx.register_csv(
-            "test",
-            tmp_dir.path().to_str().unwrap(),
-            CsvReadOptions::new().schema(&schema).has_header(false),
-        )
-        .await?;
-
-        let results = plan_and_collect(
-            &ctx,
-            "
-              SELECT
-                c_group,
-                COUNT(c_uint64),
-                COUNT(DISTINCT c_int8),
-                COUNT(DISTINCT c_int16),
-                COUNT(DISTINCT c_int32),
-                COUNT(DISTINCT c_int64),
-                COUNT(DISTINCT c_uint8),
-                COUNT(DISTINCT c_uint16),
-                COUNT(DISTINCT c_uint32),
-                COUNT(DISTINCT c_uint64)
-              FROM test
-              GROUP BY c_group
-            ",
-        )
-        .await?;
-
-        Ok(results)
-    }
-
-    #[tokio::test]
-    async fn count_distinct_integers_aggregated_single_partition() -> Result<()> {
-        let partitions = vec![
-            // The first member of each tuple will be the value for the
-            // `c_group` column, and the second member will be the value for
-            // each of the int/uint fields.
-            vec![
-                ("a", 1),
-                ("a", 1),
-                ("a", 2),
-                ("b", 9),
-                ("c", 9),
-                ("c", 10),
-                ("c", 9),
-            ],
-        ];
-
-        let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
-
-        let expected = vec![
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-            "| a       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
-            "| b       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
-            "| c       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn count_distinct_integers_aggregated_multiple_partitions() -> Result<()> {
-        let partitions = vec![
-            // The first member of each tuple will be the value for the
-            // `c_group` column, and the second member will be the value for
-            // each of the int/uint fields.
-            vec![("a", 1), ("a", 1), ("a", 2), ("b", 9), ("c", 9)],
-            vec![("a", 1), ("a", 3), ("b", 8), ("b", 9), ("b", 10), ("b", 11)],
-        ];
-
-        let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
-
-        let expected = vec![
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-            "| a       | 5                    | 3                           | 3                            | 3                            | 3                            | 3                            | 3                             | 3                             | 3                             |",
-            "| b       | 5                    | 4                           | 4                            | 4                            | 4                            | 4                            | 4                             | 4                             | 4                             |",
-            "| c       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
-            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
-        ];
-        assert_batches_sorted_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn aggregate_with_alias() -> Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, 1).await?;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("c1", DataType::Utf8, false),
-            Field::new("c2", DataType::UInt32, false),
-        ]));
-
-        let plan = LogicalPlanBuilder::scan_empty(None, schema.as_ref(), None)?
-            .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
-            .project(vec![col("c1"), sum(col("c2")).alias("total_salary")])?
-            .build()?;
-
-        let plan = ctx.optimize(&plan)?;
-
-        let physical_plan = ctx.create_physical_plan(&Arc::new(plan)).await?;
-        assert_eq!("c1", physical_plan.schema().field(0).name().as_str());
-        assert_eq!(
-            "total_salary",
-            physical_plan.schema().field(1).name().as_str()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn limit() -> Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, 1).await?;
-        ctx.register_table("t", test::table_with_sequence(1, 1000).unwrap())
-            .unwrap();
-
-        let results = plan_and_collect(&ctx, "SELECT i FROM t ORDER BY i DESC limit 3")
-            .await
-            .unwrap();
-
-        let expected = vec![
-            "+------+", "| i    |", "+------+", "| 1000 |", "| 999  |", "| 998  |",
-            "+------+",
-        ];
-
-        assert_batches_eq!(expected, &results);
-
-        let results = plan_and_collect(&ctx, "SELECT i FROM t ORDER BY i limit 3")
-            .await
-            .unwrap();
-
-        let expected = vec![
-            "+---+", "| i |", "+---+", "| 1 |", "| 2 |", "| 3 |", "+---+",
-        ];
-
-        assert_batches_eq!(expected, &results);
-
-        let results = plan_and_collect(&ctx, "SELECT i FROM t limit 3")
-            .await
-            .unwrap();
-
-        // the actual rows are not guaranteed, so only check the count (should be 3)
-        let num_rows: usize = results.into_iter().map(|b| b.num_rows()).sum();
-        assert_eq!(num_rows, 3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn limit_multi_partitions() -> Result<()> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, 1).await?;
-
-        let partitions = vec![
-            vec![test::make_partition(0)],
-            vec![test::make_partition(1)],
-            vec![test::make_partition(2)],
-            vec![test::make_partition(3)],
-            vec![test::make_partition(4)],
-            vec![test::make_partition(5)],
-        ];
-        let schema = partitions[0][0].schema();
-        let provider = Arc::new(MemTable::try_new(schema, partitions).unwrap());
-
-        ctx.register_table("t", provider).unwrap();
-
-        // select all rows
-        let results = plan_and_collect(&ctx, "SELECT i FROM t").await.unwrap();
-
-        let num_rows: usize = results.into_iter().map(|b| b.num_rows()).sum();
-        assert_eq!(num_rows, 15);
-
-        for limit in 1..10 {
-            let query = format!("SELECT i FROM t limit {}", limit);
-            let results = plan_and_collect(&ctx, &query).await.unwrap();
-
-            let num_rows: usize = results.into_iter().map(|b| b.num_rows()).sum();
-            assert_eq!(num_rows, limit, "mismatch with query {}", query);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn case_sensitive_identifiers_functions() {
-        let ctx = SessionContext::new();
-        ctx.register_table("t", test::table_with_sequence(1, 1).unwrap())
-            .unwrap();
-
-        let expected = vec![
-            "+-----------+",
-            "| sqrt(t.i) |",
-            "+-----------+",
-            "| 1         |",
-            "+-----------+",
-        ];
-
-        let results = plan_and_collect(&ctx, "SELECT sqrt(i) FROM t")
-            .await
-            .unwrap();
-
-        assert_batches_sorted_eq!(expected, &results);
-
-        let results = plan_and_collect(&ctx, "SELECT SQRT(i) FROM t")
-            .await
-            .unwrap();
-        assert_batches_sorted_eq!(expected, &results);
-
-        // Using double quotes allows specifying the function name with capitalization
-        let err = plan_and_collect(&ctx, "SELECT \"SQRT\"(i) FROM t")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Error during planning: Invalid function 'SQRT'"
-        );
-
-        let results = plan_and_collect(&ctx, "SELECT \"sqrt\"(i) FROM t")
-            .await
-            .unwrap();
-        assert_batches_sorted_eq!(expected, &results);
-    }
-
-    #[tokio::test]
-    async fn case_builtin_math_expression() {
-        let ctx = SessionContext::new();
-
-        let type_values = vec![
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::UInt8,
-                Arc::new(UInt8Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::UInt16,
-                Arc::new(UInt16Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::UInt32,
-                Arc::new(UInt32Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::UInt64,
-                Arc::new(UInt64Array::from_slice(&[1])) as ArrayRef,
-            ),
-            (
-                DataType::Float32,
-                Arc::new(Float32Array::from_slice(&[1.0_f32])) as ArrayRef,
-            ),
-            (
-                DataType::Float64,
-                Arc::new(Float64Array::from_slice(&[1.0_f64])) as ArrayRef,
-            ),
-        ];
-
-        for (data_type, array) in type_values.iter() {
-            let schema =
-                Arc::new(Schema::new(vec![Field::new("v", data_type.clone(), false)]));
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
-            let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-            ctx.deregister_table("t").unwrap();
-            ctx.register_table("t", Arc::new(provider)).unwrap();
-            let expected = vec![
-                "+-----------+",
-                "| sqrt(t.v) |",
-                "+-----------+",
-                "| 1         |",
-                "+-----------+",
-            ];
-            let results = plan_and_collect(&ctx, "SELECT sqrt(v) FROM t")
-                .await
-                .unwrap();
-
-            assert_batches_sorted_eq!(expected, &results);
-        }
-    }
-
-    #[tokio::test]
     async fn case_sensitive_identifiers_user_defined_functions() -> Result<()> {
         let mut ctx = SessionContext::new();
         ctx.register_table("t", test::table_with_sequence(1, 1).unwrap())
@@ -2933,46 +1727,6 @@ mod tests {
         assert_batches_eq!(expected, &result);
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn case_sensitive_identifiers_aggregates() {
-        let ctx = SessionContext::new();
-        ctx.register_table("t", test::table_with_sequence(1, 1).unwrap())
-            .unwrap();
-
-        let expected = vec![
-            "+----------+",
-            "| MAX(t.i) |",
-            "+----------+",
-            "| 1        |",
-            "+----------+",
-        ];
-
-        let results = plan_and_collect(&ctx, "SELECT max(i) FROM t")
-            .await
-            .unwrap();
-
-        assert_batches_sorted_eq!(expected, &results);
-
-        let results = plan_and_collect(&ctx, "SELECT MAX(i) FROM t")
-            .await
-            .unwrap();
-        assert_batches_sorted_eq!(expected, &results);
-
-        // Using double quotes allows specifying the function name with capitalization
-        let err = plan_and_collect(&ctx, "SELECT \"MAX\"(i) FROM t")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Error during planning: Invalid function 'MAX'"
-        );
-
-        let results = plan_and_collect(&ctx, "SELECT \"max\"(i) FROM t")
-            .await
-            .unwrap();
-        assert_batches_sorted_eq!(expected, &results);
     }
 
     #[tokio::test]
@@ -3074,62 +1828,6 @@ mod tests {
         for thread in threads {
             thread.join().expect("Failed to join thread")?;
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn ctx_sql_should_optimize_plan() -> Result<()> {
-        let ctx = SessionContext::new();
-        let plan1 = ctx
-            .create_logical_plan("SELECT * FROM (SELECT 1) AS one WHERE TRUE AND TRUE")?;
-
-        let opt_plan1 = ctx.optimize(&plan1)?;
-
-        let plan2 = ctx
-            .sql("SELECT * FROM (SELECT 1) AS one WHERE TRUE AND TRUE")
-            .await?;
-
-        assert_eq!(
-            format!("{:?}", opt_plan1),
-            format!("{:?}", plan2.to_logical_plan())
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn simple_avg() -> Result<()> {
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-
-        let batch1 = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![Arc::new(Int32Array::from_slice(&[1, 2, 3]))],
-        )?;
-        let batch2 = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![Arc::new(Int32Array::from_slice(&[4, 5]))],
-        )?;
-
-        let ctx = SessionContext::new();
-
-        let provider =
-            MemTable::try_new(Arc::new(schema), vec![vec![batch1], vec![batch2]])?;
-        ctx.register_table("t", Arc::new(provider))?;
-
-        let result = plan_and_collect(&ctx, "SELECT AVG(a) FROM t").await?;
-
-        let batch = &result[0];
-        assert_eq!(1, batch.num_columns());
-        assert_eq!(1, batch.num_rows());
-
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("failed to cast version");
-        assert_eq!(values.len(), 1);
-        // avg(1,2,3,4,5) = 3.0
-        assert_eq!(values.value(0), 3.0_f64);
         Ok(())
     }
 
@@ -3336,6 +2034,60 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn read_with_glob_path() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let df = ctx
+            .read_parquet(
+                format!("{}/alltypes_plain*.parquet", parquet_test_data()),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        let results = df.collect().await?;
+        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
+        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
+        assert_eq!(total_rows, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_with_glob_path_issue_2465() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let df = ctx
+            .read_parquet(
+                // it was reported that when a path contains // (two consecutive separator) no files were found
+                // in this test, regardless of parquet_test_data() value, our path now contains a //
+                format!("{}/..//*/alltypes_plain*.parquet", parquet_test_data()),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        let results = df.collect().await?;
+        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
+        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
+        assert_eq!(total_rows, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_from_registered_table_with_glob_path() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        ctx.register_parquet(
+            "test",
+            &format!("{}/alltypes_plain*.parquet", parquet_test_data()),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        let df = ctx.sql("SELECT * FROM test").await?;
+        let results = df.collect().await?;
+        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
+        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
+        assert_eq!(total_rows, 10);
+        Ok(())
+    }
+
     struct MyPhysicalPlanner {}
 
     #[async_trait]
@@ -3383,13 +2135,6 @@ mod tests {
         sql: &str,
     ) -> Result<Vec<RecordBatch>> {
         ctx.sql(sql).await?.collect().await
-    }
-
-    /// Execute SQL and return results
-    async fn execute(sql: &str, partition_count: usize) -> Result<Vec<RecordBatch>> {
-        let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, partition_count).await?;
-        plan_and_collect(&ctx, sql).await
     }
 
     /// Generate CSV partitions within the supplied directory

@@ -694,7 +694,6 @@ impl SortExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for SortExec {
     fn as_any(&self) -> &dyn Any {
         self
@@ -748,7 +747,7 @@ impl ExecutionPlan for SortExec {
         )?))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -775,7 +774,7 @@ impl ExecutionPlan for SortExec {
             partition
         );
 
-        let input = self.input.execute(partition, context.clone()).await?;
+        let input = self.input.execute(partition, context.clone())?;
 
         debug!("End SortExec's input.execute for partition: {}", partition);
 
@@ -916,21 +915,16 @@ async fn do_sort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::execution::context::SessionConfig;
     use crate::execution::runtime_env::RuntimeConfig;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use crate::physical_plan::collect;
     use crate::physical_plan::expressions::col;
     use crate::physical_plan::memory::MemoryExec;
-    use crate::physical_plan::{
-        collect,
-        file_format::{CsvExec, FileScanConfig},
-    };
     use crate::prelude::SessionContext;
     use crate::test;
     use crate::test::assert_is_pending;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
-    use crate::test_util;
     use arrow::array::*;
     use arrow::compute::SortOptions;
     use arrow::datatypes::*;
@@ -941,24 +935,9 @@ mod tests {
     async fn test_in_mem_sort() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions)?;
-
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: Arc::clone(&schema),
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let csv = test::scan_partitioned_csv(partitions)?;
+        let schema = csv.schema();
 
         let sort_exec = Arc::new(SortExec::try_new(
             vec![
@@ -978,7 +957,7 @@ mod tests {
                     options: SortOptions::default(),
                 },
             ],
-            Arc::new(CoalescePartitionsExec::new(Arc::new(csv))),
+            Arc::new(CoalescePartitionsExec::new(csv)),
         )?);
 
         let result = collect(sort_exec, task_ctx).await?;
@@ -1018,24 +997,9 @@ mod tests {
         let runtime = Arc::new(RuntimeEnv::new(config)?);
         let session_ctx = SessionContext::with_config_rt(SessionConfig::new(), runtime);
 
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions)?;
-
-        let csv = CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: Arc::clone(&schema),
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        );
+        let csv = test::scan_partitioned_csv(partitions)?;
+        let schema = csv.schema();
 
         let sort_exec = Arc::new(SortExec::try_new(
             vec![
@@ -1055,7 +1019,7 @@ mod tests {
                     options: SortOptions::default(),
                 },
             ],
-            Arc::new(CoalescePartitionsExec::new(Arc::new(csv))),
+            Arc::new(CoalescePartitionsExec::new(csv)),
         )?);
 
         let task_ctx = session_ctx.task_ctx();
@@ -1143,7 +1107,7 @@ mod tests {
         // explicitlty ensure the metadata is present
         assert_eq!(
             result[0].schema().fields()[0].metadata(),
-            &Some(field_metadata)
+            Some(&field_metadata)
         );
         assert_eq!(result[0].schema().metadata(), &schema_metadata);
 

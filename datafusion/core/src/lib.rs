@@ -52,11 +52,11 @@
 //!    .to_string();
 //!
 //! let expected = vec![
-//!     "+---+--------------------------+",
-//!     "| a | MIN(tests/example.csv.b) |",
-//!     "+---+--------------------------+",
-//!     "| 1 | 2                        |",
-//!     "+---+--------------------------+"
+//!     "+---+----------------+",
+//!     "| a | MIN(?table?.b) |",
+//!     "+---+----------------+",
+//!     "| 1 | 2              |",
+//!     "+---+----------------+"
 //! ];
 //!
 //! assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
@@ -158,7 +158,7 @@
 //!
 //! * Projection: [`ProjectionExec`](physical_plan::projection::ProjectionExec)
 //! * Filter: [`FilterExec`](physical_plan::filter::FilterExec)
-//! * Hash and Grouped aggregations: [`HashAggregateExec`](physical_plan::hash_aggregate::HashAggregateExec)
+//! * Grouped and non-grouped aggregations: [`AggregateExec`](physical_plan::aggregates::AggregateExec)
 //! * Sort: [`SortExec`](physical_plan::sorts::sort::SortExec)
 //! * Coalesce partitions: [`CoalescePartitionsExec`](physical_plan::coalesce_partitions::CoalescePartitionsExec)
 //! * Limit: [`LocalLimitExec`](physical_plan::limit::LocalLimitExec) and [`GlobalLimitExec`](physical_plan::limit::GlobalLimitExec)
@@ -218,7 +218,8 @@ pub mod physical_optimizer;
 pub mod physical_plan;
 pub mod prelude;
 pub mod scalar;
-pub mod sql;
+#[cfg(feature = "scheduler")]
+pub mod scheduler;
 pub mod variable;
 
 // re-export dependencies from arrow-rs to minimise version maintenance for crate users
@@ -230,14 +231,14 @@ pub use datafusion_common as common;
 pub use datafusion_data_access;
 pub use datafusion_expr as logical_expr;
 pub use datafusion_physical_expr as physical_expr;
+pub use datafusion_sql as sql;
 
-#[cfg(feature = "row")]
 pub use datafusion_row as row;
 
 #[cfg(feature = "jit")]
 pub use datafusion_jit as jit;
 
-pub mod from_slice;
+pub use physical_expr::from_slice;
 
 #[cfg(test)]
 pub mod test;
